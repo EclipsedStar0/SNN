@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from tokenizers import Tokenizer, models, trainers, pre_tokenizers
+from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
 import re
 import random
 import time
@@ -177,35 +177,49 @@ class MoEFFN(nn.Module):
         # Gating network
         self.gate = nn.Linear(config.d_model, num_experts, bias=False)
         
+        self.load_balancing_loss = None
+        
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
+        x_flat = x.view(-1, C)  # [B*T, C]
         
-        # Get gating scores
-        gates = self.gate(x)  # [B, T, num_experts]
-        
-        # Top-k routing
+        # Gating
+        gates = self.gate(x_flat)  # [B*T, num_experts]
         top_k_weights, top_k_indices = torch.topk(gates, self.top_k, dim=-1)
-        top_k_weights = F.softmax(top_k_weights, dim=-1)
+        top_k_weights = F.softmax(top_k_weights, dim=-1)  # [B*T, top_k]
+        
+        if self.training and self.num_experts > 0:
+            # Importance: how much each expert is weighted
+            importance = F.softmax(gates, dim=-1).sum(0)  # [num_experts]
+            
+            # Load: how many tokens are routed to each expert
+            load = torch.zeros(self.num_experts, device=x.device)
+            for i in range(self.num_experts):
+                load[i] = (top_k_indices == i).float().sum()
+            
+            # Normalize and compute loss (encourages uniform distribution)
+            importance = importance / importance.sum()
+            load = load / load.sum()
+            self.load_balancing_loss = (importance * load).sum() * self.num_experts
+        else:
+            self.load_balancing_loss = None
         
         # Initialize output
-        output = torch.zeros_like(x)
+        output = torch.zeros_like(x_flat)
         
-        # Expert computation
-        for i, expert in enumerate(self.experts):
-            # Create mask for this expert
-            expert_mask = (top_k_indices == i).any(dim=-1)
+        # For each selected expert position
+        for k in range(self.top_k):
+            expert_indices = top_k_indices[:, k]  # [B*T]
+            weights = top_k_weights[:, k:k+1]  # [B*T, 1]
             
-            if expert_mask.any():
-                expert_input = x[expert_mask]
-                expert_output = expert(expert_input)
-                
-                # Get weights for this expert
-                expert_weights = top_k_weights[expert_mask]
-                expert_weights = expert_weights[top_k_indices[expert_mask] == i].unsqueeze(-1)
-                
-                output[expert_mask] += expert_output * expert_weights
+            # Process each expert
+            for expert_id in range(self.num_experts):
+                mask = expert_indices == expert_id
+                if mask.any():
+                    expert_out = self.experts[expert_id](x_flat[mask])
+                    output[mask] += expert_out * weights[mask]
         
-        return output
+        return output.view(B, T, C)
     
 
 class FeedForward(nn.Module):
@@ -360,8 +374,8 @@ class LanguageModel(nn.Module):
             'config': self.config,
             'model_state_dict': self.state_dict(),
             'tokenizer_vocab': tokenizer.get_vocab(),
-            'tokenizer_merges': tokenizer.merges,
-            'tokenizer_word_freqs': tokenizer.word_freqs
+            #'tokenizer_merges': tokenizer.merges,
+            #'tokenizer_word_freqs': tokenizer.word_freqs
         }, path)
         print(f'Checkpoint saved to {path}')
     
@@ -375,8 +389,8 @@ class LanguageModel(nn.Module):
         tokenizer = Tokenizer(models.BPE(unk_token="<UNK>"))
         tokenizer.add_tokens(checkpoint['tokenizer_vocab'].items())
         tokenizer.add_special_tokens([BOS_TOKEN, EOS_TOKEN, UNK_TOKEN, PAD_TOKEN, SEP_TOKEN])
-        tokenizer.merges = checkpoint['tokenizer_merges']
-        tokenizer.word_freqs = checkpoint['tokenizer_word_freqs']
+        #tokenizer.merges = checkpoint['tokenizer_merges']
+        #tokenizer.word_freqs = checkpoint['tokenizer_word_freqs']
         
         tokenizer.token_to_id = {token: idx for idx, token in enumerate(tokenizer.get_vocab())}
         tokenizer.id_to_token = {idx: token for token, idx in tokenizer.token_to_id.items()}
@@ -393,15 +407,28 @@ class TextDataset(Dataset):
         self.sequences = []
         
         print("Splitting into chunks")
+        chunks = []
+        initial_text_len = 0
+        for chunk in texts.split(SEP_TOKEN):
+            temp = chunk.strip()
+            if len(temp) > 0:
+                chunks.append(temp)
+                initial_text_len += len(temp)
+        
         chunks = [chunk.strip() for chunk in texts.split(SEP_TOKEN) if len(chunk.strip()) > 0]
         print(f"We have {len(chunks)} chunks perform sliding window on")
         
         self.sequences = []
         chunk_token_ids = []
-        print("Tokenizing chunks...")
-        encoded = tokenizer.encode_batch(chunks)
-        chunk_token_ids = [encoded_chunk.ids for encoded_chunk in encoded]
+        size_of_base_text = 0
         
+        for chunk in tqdm(chunks, desc="Tokenizing chunks"):
+            encoded = self.tokenizer.encode(chunk)  # This encodes the entire chunk
+            size_of_base_text += len(encoded.ids)
+            chunk_token_ids.append(encoded.ids)
+        
+        print(f"Our Corpus is {initial_text_len} characters long; Our Corpus is {size_of_base_text} tokens long.")
+        print("Finding Large Chunks...")
         chunk_sizes = [len(ids) for ids in chunk_token_ids]
         large_chunks = [(i, size) for i, size in enumerate(chunk_sizes) if size > 10000]
 
@@ -417,20 +444,20 @@ class TextDataset(Dataset):
         boundary_sequences = 0
         boundary_tokens = 0
         
+        stride_len = 20
         for token_ids in tqdm(chunk_token_ids, desc="Splitting Chunks"):
             if len(token_ids) >= seq_len:
                 num_sequences_in_chunk = len(token_ids) - seq_len
                 boundary_sequences += num_sequences_in_chunk
                 
-                for i in tqdm(list(range(0, num_sequences_in_chunk + 1)), desc="Splitting into Sequence"):
+                for i in tqdm(list(range(0, num_sequences_in_chunk + 1, stride_len)), desc="Splitting into Sequence"):
                     sequence = token_ids[i:i + seq_len + 1]
                     self.sequences.append(sequence)
                     boundary_tokens += len(sequence)  # Each sequence has seq_len+1 tokens
         
         # Calculate contiguous approach for comparison
-        all_tokens = self.tokenizer.encode(texts)
-        contiguous_sequences = max(0, len(all_tokens) - seq_len)
-        contiguous_tokens = contiguous_sequences * (seq_len + 1)  # Each sequence has seq_len+1 tokens
+        contiguous_sequences = max(0, (size_of_base_text - seq_len) / stride_len)
+        contiguous_tokens = contiguous_sequences * (seq_len + 1)   # Each sequence has seq_len+1 tokens
         
         print(f"Boundary-aware: {boundary_sequences} sequences, {boundary_tokens} tokens")
         print(f"Contiguous: {contiguous_sequences} sequences, {contiguous_tokens} tokens")
@@ -538,6 +565,15 @@ class MemoryEfficientTrainer:
                     logits = self.model(x, mask)
                     loss = self.criterion(logits.view(-1, logits.size(-1)), y.view(-1))
                 
+                    if self.config.use_moe and self.config.num_experts > 0:
+                        lb_loss = 0.0
+                        for block in self.model.blocks:
+                            if hasattr(block.ffn, 'load_balancing_loss') and block.ffn.load_balancing_loss is not None:
+                                lb_loss += block.ffn.load_balancing_loss
+                        
+                        # Add load balancing loss with a small weight (0.01 is typical)
+                        loss = loss + 0.01 * lb_loss
+                
                 # Mixed precision backward pass
                 self.optimizer.zero_grad()
                 self.scaler.scale(loss).backward()
@@ -567,7 +603,7 @@ class MemoryEfficientTrainer:
                 
                 # Save checkpoint
                 if global_step % save_interval == 0 or time.time() - last_save_time >= 1800:
-                    self.model.save_checkpoint(f'models/text_completion_23_D_mini_checkpoint_step_{global_step}.pth')
+                    self.model.save_checkpoint(f'models/text_completion_24_D_7M_guten_checkpoint_step_{global_step}.pth')
                     last_save_time = time.time()
             
             avg_loss = np.mean(epoch_losses)
@@ -630,7 +666,7 @@ def load_txt_files_with_pathlib(directory_path):
     # For recursive search:
     number_of_files_searched = 0
     for file_path in directory.rglob("*.txt"):
-        if number_of_files_searched > 3:
+        if number_of_files_searched > 600:
             break
         try:
             content = file_path.read_text(encoding='utf-8')
@@ -647,9 +683,10 @@ def train_tokenizer(provided_vocab_size, provided_special_tokens, provided_train
     bpe_trainer = trainers.BpeTrainer(vocab_size=provided_vocab_size, special_tokens=provided_special_tokens)
     function_tokenizer = Tokenizer(models.BPE(unk_token="<UNK>"))
     function_tokenizer.pre_tokenizer = pre_tokenizers.Sequence([
-        pre_tokenizers.WhitespaceSplit(),
-        pre_tokenizers.Punctuation()
+        pre_tokenizers.ByteLevel()
     ])
+    
+    function_tokenizer.decoder = decoders.ByteLevel()
     
     function_tokenizer.train_from_iterator(provided_training_data, trainer=bpe_trainer)
     return function_tokenizer
@@ -710,8 +747,10 @@ And then, at the southern pole of the Earth, is Antarctica, the Earth's southern
     
     print("Extending Non-File data...")
     training_data.extend(small_training_data)
-    print("Fixing data loaded from files...")
-    training_data = [ftfy.fix_text(text) for text in training_data]
+    
+    index = 0
+    for text in tqdm(training_data, desc="Fixing file data"):
+        training_data[index] = ftfy.fix_text(text)
             
     # Train tokenizer
     print("Training tokenizer...")
@@ -724,8 +763,6 @@ And then, at the southern pole of the Earth, is Antarctica, the Earth's southern
     print(tokenizer.get_vocab())
     print(f"Vocabulary size: {len(tokenizer.get_vocab())}")
     tData = "".join(training_data)
-    print(len(tData))
-    print(len(tokenizer.encode(tData)))
     
     config = ModelConfig(
         vocab_size=len(tokenizer.get_vocab()),
@@ -735,9 +772,9 @@ And then, at the southern pole of the Earth, is Antarctica, the Earth's southern
         n_heads=2, # was 4
         dropout=0.1,
         d_ff = 2048,
-        use_moe = True,  # Add this
-        num_experts = 0,  # Was 4
-        moe_top_k = 0    # Was 2
+        use_moe = False,  # Add this
+        num_experts = 3,  # Was 4
+        moe_top_k = 1    # Was 2
         # NOTE: increased dropout = increased loss; 0.3 has double loss of 0.2; 0.2 lags around 10/20 Epochs behing 0.1
         # 512 * 8 * 4 * 2048
     )
@@ -766,4 +803,4 @@ And then, at the southern pole of the Earth, is Antarctica, the Earth's southern
     )
     
     # Save final model
-    model.save_checkpoint('models/text_completion_23_D_mini_Final.pth')
+    model.save_checkpoint('models/text_completion_24_D_7M_guten_Final.pth')

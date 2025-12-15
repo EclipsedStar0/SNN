@@ -13,7 +13,7 @@ def normalize_newlines(content):
     """
     # IMPORTANT: Process from smallest to largest to avoid cascading replacements
     # First replace single newlines with nothing
-    content = re.sub(r'(?<!\n)\n(?!\n)', '', content)
+    content = re.sub(r'(?<!\n)\n(?!\n)', ' ', content)
     
     # Then replace double newlines with single newline
     content = content.replace('\n' * 2, '\n' * 1)
@@ -43,7 +43,7 @@ def normalize_newlines_regex(content):
         
         # Apply the rules:
         if newline_count == 1:
-            return ''  # 0 newlines
+            return ' '  # 0 newlines
         elif newline_count == 2:
             return '\n' * 1  # 1 newline
         elif newline_count == 3:
@@ -79,6 +79,7 @@ def normalize_newlines_efficient(content):
             if newline_count == 1:
                 # 1 newline -> 0 newlines (remove it)
                 pass  # Don't add anything
+                result.append(' ')
             elif newline_count == 2:
                 # 2 newlines -> 1 newline
                 result.append('\n')
