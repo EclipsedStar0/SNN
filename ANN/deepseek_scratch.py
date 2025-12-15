@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from tokenizers import Tokenizer, models, trainers, pre_tokenizers
 import re
 import random
 import time
@@ -13,6 +14,16 @@ from dataclasses import dataclass
 from tqdm.auto import tqdm
 import ftfy
 from collections import defaultdict
+
+PAD_TOKEN = "<PAD>"
+SEP_TOKEN = "<SEP>"
+BOS_TOKEN = "<BOS>"
+EOS_TOKEN = "<EOS>"
+UNK_TOKEN = "<UNK>"
+
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f"Using device: {device}")
+
 
 @dataclass
 class ModelConfig:
@@ -32,210 +43,10 @@ class ModelConfig:
     
     def __post_init__(self):
         assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"
+        
 
-class SimpleBPETokenizer:
-    """Byte-Pair Encoding tokenizer with improved efficiency."""
-    
-    SPECIAL_TOKENS = ["<PAD>", "<BOS>", "<EOS>", "<UNK>"]
-    
-    def __init__(self):
-        self.vocab: List[str] = []
-        self.merges: Dict[Tuple[str, str], str] = {}
-        self.token_to_id: Dict[str, int] = {}
-        self.id_to_token: Dict[int, str] = {}
-        self.word_freqs: Dict[str, int] = defaultdict(int)
-        
-    def train(self, texts: str, 
-          target_compression: float = 0.5,
-          min_frequency: int = 2,
-          max_vocab_size: int = 50000,
-          min_improvement: float = 0.001) -> List[str]:
-        """Train BPE with accurate compression tracking."""
-        
-        # Build word frequencies and calculate true initial length
-        initial_char_count = 0
-        texts = re.sub(r'\s+', ' ', texts.strip())
-        words = texts.split(' ')
-        for i, word in enumerate(words):
-            if not word:
-                continue
-            word_with_space = 'Ġ' + word if i > 0 else word
-            self.word_freqs[word_with_space] += 1
-        initial_char_count += len(texts)
-        
-        # Build alphabet
-        alphabet = sorted(set(char for word in self.word_freqs for char in word))
-        self.vocab = self.SPECIAL_TOKENS + alphabet
-        splits = {word: list(word) for word in self.word_freqs}
-        
-        # Calculate initial token count (character-level tokens)
-        current_token_count = sum(len(chars) * freq for word, (chars, freq) in 
-                                 ((word, (splits[word], self.word_freqs[word])) 
-                                  for word in self.word_freqs))
-        print(current_token_count, initial_char_count)
-        previous_compression = 1.0
-        pbar = tqdm(desc="Training BPE")
-        
-        while len(self.vocab) < max_vocab_size:
-            pair_freqs = self._get_pair_frequencies(splits)
-            if not pair_freqs:
-                break
-                
-            best_pair = max(pair_freqs, key=pair_freqs.get)
-            best_freq = pair_freqs[best_pair]
-            
-            # Calculate current compression ratio
-            current_compression = current_token_count / initial_char_count
-            #print(current_compression,' ')
-            
-            # Stopping criteria
-            if best_freq < min_frequency:
-                #print(best_freq, min_frequency)
-                break
-            if current_compression <= target_compression:
-                #print(current_compression, target_compression)
-                break
-                
-            # Check improvement
-            improvement = previous_compression - current_compression
-            #print(improvement)
-            if improvement < min_improvement and len(self.vocab) > 1000:
-                break
-            
-            # Perform merge and update token count accurately
-            # Each merge reduces token count by the frequency (since we replace 2 tokens with 1)
-            token_reduction = best_freq
-            current_token_count -= token_reduction
-            
-            splits = self._merge_pair(*best_pair, splits)
-            merged_token = best_pair[0] + best_pair[1]
-            self.merges[best_pair] = merged_token
-            
-            if merged_token not in self.vocab:
-                self.vocab.append(merged_token)
-            
-            previous_compression = current_compression
-            pbar.set_description(f"Vocab: {len(self.vocab)}, True Comp: {current_compression:.3f}")
-        
-        pbar.close()
-        
-        # Build dictionaries
-        self.token_to_id = {token: idx for idx, token in enumerate(self.vocab)}
-        self.id_to_token = {idx: token for token, idx in self.token_to_id.items()}
-        
-        # Verify actual compression
-        actual_compression = self._measure_actual_compression(texts)
-        print(f"Final vocabulary size: {len(self.vocab)}")
-        print(f"Training compression: {current_compression:.3f}")
-        print(f"Actual compression: {actual_compression:.3f}")
-        
-        return self.vocab
-    
-    def _measure_actual_compression(self, texts: List[str]) -> float:
-        """Measure the actual compression ratio on the training data."""
-        total_chars = 0
-        total_tokens = 0
-        
-        for text in texts:
-            # Count original characters (without special space markers)
-            clean_text = re.sub(r'\s+', ' ', text.strip())
-            total_chars += len(clean_text)
-            
-            # Count tokens after tokenization
-            tokens = self.encode(text)
-            total_tokens += len(tokens)
-        
-        return total_tokens / total_chars if total_chars > 0 else 1.0
-    
-    def _get_pair_frequencies(self, splits: Dict[str, List[str]]) -> Dict[Tuple[str, str], int]:
-        """Calculate frequency of adjacent token pairs."""
-        pair_freqs = defaultdict(int)
-        for word, freq in self.word_freqs.items():
-            split = splits[word]
-            if len(split) < 2:
-                continue
-            for i in range(len(split) - 1):
-                pair = (split[i], split[i + 1])
-                pair_freqs[pair] += freq
-        return pair_freqs
-    
-    def _merge_pair(self, a: str, b: str, splits: Dict[str, List[str]]) -> Dict[str, List[str]]:
-        """Merge all occurrences of pair (a, b)."""
-        for word in self.word_freqs:
-            split = splits[word]
-            if len(split) < 2:
-                continue
-            
-            i = 0
-            while i < len(split) - 1:
-                if split[i] == a and split[i + 1] == b:
-                    split = split[:i] + [a + b] + split[i + 2:]
-                else:
-                    i += 1
-            splits[word] = split
-        return splits
-    
-    def encode(self, text: str) -> List[int]:
-        """Tokenize text into token IDs."""
-        text = re.sub(r'\s+', ' ', text.strip())
-        words = text.split(' ')
-        
-        tokens = []
-        for i, word in enumerate(words):
-            if not word:
-                continue
-            
-            word_to_tokenize = 'Ġ' + word if i > 0 else word
-            split = list(word_to_tokenize)
-            
-            # Apply learned merges
-            changed = True
-            while changed and len(split) > 1:
-                changed = False
-                i = 0
-                while i < len(split) - 1:
-                    pair = (split[i], split[i + 1])
-                    if pair in self.merges:
-                        split = split[:i] + [self.merges[pair]] + split[i + 2:]
-                        changed = True
-                    else:
-                        i += 1
-            
-            # Convert to IDs
-            for token in split:
-                tokens.append(self.token_to_id.get(token, self.token_to_id["<UNK>"]))
-        
-        return tokens
-    
-    def decode(self, token_ids: List[int]) -> str:
-        """Convert token IDs back to text."""
-        tokens = [self.id_to_token[i] for i in token_ids if i in self.id_to_token]
-        
-        text = ""
-        for token in tokens:
-            if token in self.SPECIAL_TOKENS:
-                continue
-            if token.startswith('Ġ'):
-                text += ' ' + token[1:] if text else token[1:]
-            else:
-                text += token
-        
-        return text.strip()
-    
-    @property
-    def pad_token_id(self) -> int:
-        return self.token_to_id["<PAD>"]
-    
-    @property
-    def bos_token_id(self) -> int:
-        return self.token_to_id["<BOS>"]
-    
-    @property
-    def eos_token_id(self) -> int:
-        return self.token_to_id["<EOS>"]
-        
-    def size(self):
-        return len(self.dictionary)
+
+
 
 
 class RoPEPositionalEncoding(nn.Module):
@@ -548,7 +359,7 @@ class LanguageModel(nn.Module):
         torch.save({
             'config': self.config,
             'model_state_dict': self.state_dict(),
-            'tokenizer_vocab': tokenizer.vocab,
+            'tokenizer_vocab': tokenizer.get_vocab(),
             'tokenizer_merges': tokenizer.merges,
             'tokenizer_word_freqs': tokenizer.word_freqs
         }, path)
@@ -561,12 +372,13 @@ class LanguageModel(nn.Module):
             checkpoint = torch.load(path, map_location=device)
         model = LanguageModel(checkpoint['config'])
         model.load_state_dict(checkpoint['model_state_dict'])
-        tokenizer = SimpleBPETokenizer()
-        tokenizer.vocab = checkpoint['tokenizer_vocab']
+        tokenizer = Tokenizer(models.BPE(unk_token="<UNK>"))
+        tokenizer.add_tokens(checkpoint['tokenizer_vocab'].items())
+        tokenizer.add_special_tokens([BOS_TOKEN, EOS_TOKEN, UNK_TOKEN, PAD_TOKEN, SEP_TOKEN])
         tokenizer.merges = checkpoint['tokenizer_merges']
         tokenizer.word_freqs = checkpoint['tokenizer_word_freqs']
         
-        tokenizer.token_to_id = {token: idx for idx, token in enumerate(tokenizer.vocab)}
+        tokenizer.token_to_id = {token: idx for idx, token in enumerate(tokenizer.get_vocab())}
         tokenizer.id_to_token = {idx: token for token, idx in tokenizer.token_to_id.items()}
         
         return model.to(device), tokenizer.to(device)
@@ -581,26 +393,36 @@ class TextDataset(Dataset):
         self.sequences = []
         
         print("Splitting into chunks")
-        chunks = texts.split("<SEP>")
-        chunks = [chunk.strip() for chunk in chunks if len(chunk.strip()) > 0]
+        chunks = [chunk.strip() for chunk in texts.split(SEP_TOKEN) if len(chunk.strip()) > 0]
         print(f"We have {len(chunks)} chunks perform sliding window on")
         
         self.sequences = []
         chunk_token_ids = []
-        for chunk in tqdm(chunks, desc="Tokenizing chunks"):
-            token_ids = self.tokenizer.encode(chunk)  # This encodes the entire chunk
-            chunk_token_ids.append(token_ids)
+        print("Tokenizing chunks...")
+        encoded = tokenizer.encode_batch(chunks)
+        chunk_token_ids = [encoded_chunk.ids for encoded_chunk in encoded]
+        
+        chunk_sizes = [len(ids) for ids in chunk_token_ids]
+        large_chunks = [(i, size) for i, size in enumerate(chunk_sizes) if size > 10000]
+
+        if large_chunks:
+            print(f"\nFound {len(large_chunks)} large chunks:")
+            for idx, size in large_chunks[:5]:  # Show top 5
+                num_seqs = size - seq_len + 1
+                print(f"  Chunk {idx}: {size:,} tokens → {num_seqs:,} sequences")
+            print(f"  (Total: {sum(s for _, s in large_chunks):,} tokens in large chunks)\n")
+        
         
         # Boundary-aware approach
         boundary_sequences = 0
         boundary_tokens = 0
         
-        for token_ids in chunk_token_ids:
+        for token_ids in tqdm(chunk_token_ids, desc="Splitting Chunks"):
             if len(token_ids) >= seq_len:
                 num_sequences_in_chunk = len(token_ids) - seq_len
                 boundary_sequences += num_sequences_in_chunk
                 
-                for i in range(num_sequences_in_chunk):
+                for i in tqdm(list(range(0, num_sequences_in_chunk + 1)), desc="Splitting into Sequence"):
                     sequence = token_ids[i:i + seq_len + 1]
                     self.sequences.append(sequence)
                     boundary_tokens += len(sequence)  # Each sequence has seq_len+1 tokens
@@ -622,18 +444,18 @@ class TextDataset(Dataset):
         
         # Pad if needed (should rarely happen with proper chunk filtering)
         if len(chunk) < self.seq_len + 1:
-            chunk = chunk + [self.tokenizer.pad_token_id] * (self.seq_len + 1 - len(chunk))
+            chunk = chunk + [self.tokenizer.token_to_id(PAD_TOKEN)] * (self.seq_len + 1 - len(chunk))
         
         x = torch.tensor(chunk[:-1], dtype=torch.long)
         y = torch.tensor(chunk[1:], dtype=torch.long)
-        mask = (x != self.tokenizer.pad_token_id).long()
+        mask = (x != self.tokenizer.token_to_id(PAD_TOKEN)).long()
         
         return x, y, mask
 
 class MemoryEfficientTrainer:
     """Training loop with memory optimizations and mixed precision."""
     
-    def __init__(self, model: LanguageModel, tokenizer: SimpleBPETokenizer, config: ModelConfig,
+    def __init__(self, model: LanguageModel, tokenizer: Tokenizer, config: ModelConfig,
                  learning_rate: float = 3e-4, weight_decay: float = 5e-5, device: str = 'cuda',
                  gradient_checkpointing: bool = True):
         self.model = model.to(device)
@@ -659,10 +481,10 @@ class MemoryEfficientTrainer:
         )
         
         # Loss function
-        self.criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+        self.criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.token_to_id(PAD_TOKEN))
         
         # Mixed precision scaler
-        self.scaler = torch.cuda.amp.GradScaler(enabled=(device == 'cuda'))
+        self.scaler = torch.amp.GradScaler('cuda')
     
     def _enable_gradient_checkpointing(self):
         """Enable gradient checkpointing for transformer blocks."""
@@ -712,7 +534,7 @@ class MemoryEfficientTrainer:
                 x, y, mask = x.to(self.device), y.to(self.device), mask.to(self.device)
                 
                 # Mixed precision forward pass
-                with torch.cuda.amp.autocast(enabled=(self.device == 'cuda')):
+                with torch.amp.autocast('cuda'):
                     logits = self.model(x, mask)
                     loss = self.criterion(logits.view(-1, logits.size(-1)), y.view(-1))
                 
@@ -802,26 +624,41 @@ def load_txt_files_with_pathlib(directory_path):
     """
     Load all .txt files using pathlib (supports recursive search).
     """
-    training_data = []
+    function_training_data = []
     directory = Path(directory_path)
     
     # For recursive search:
+    number_of_files_searched = 0
     for file_path in directory.rglob("*.txt"):
+        if number_of_files_searched > 3:
+            break
         try:
             content = file_path.read_text(encoding='utf-8')
-            training_data.append(content)
+            function_training_data.append(f'{BOS_TOKEN}\n'+content+f'\n{EOS_TOKEN}{SEP_TOKEN}')
             print(f"Loaded: {file_path}")
+            number_of_files_searched += 1
         except Exception as e:
             print(f"Error reading {file_path}: {e}")
             continue
     
-    return training_data
+    return function_training_data
+
+def train_tokenizer(provided_vocab_size, provided_special_tokens, provided_training_data):
+    bpe_trainer = trainers.BpeTrainer(vocab_size=provided_vocab_size, special_tokens=provided_special_tokens)
+    function_tokenizer = Tokenizer(models.BPE(unk_token="<UNK>"))
+    function_tokenizer.pre_tokenizer = pre_tokenizers.Sequence([
+        pre_tokenizers.WhitespaceSplit(),
+        pre_tokenizers.Punctuation()
+    ])
+    
+    function_tokenizer.train_from_iterator(provided_training_data, trainer=bpe_trainer)
+    return function_tokenizer
 
 # Example usage
 if __name__ == "__main__":
     # Sample data
     small_training_data = [
-        """<BOS>cats rule the world.,
+        f"""{BOS_TOKEN}cats rule the world.,
         dogs are the best., 
         elephants have long trunks.,
         monkeys like bananas.
@@ -833,9 +670,9 @@ if __name__ == "__main__":
         hippos are big and scary.
         rhinos have horns.
         penguins live in the arctic.
-        polar bears are white.<EOS>""",
-        '<SEP>',
-        """<BOS>Modern-day Terra can summarily be divided into 12 distinct bodies, of which, seven are continents, and 5 are oceans. East of the international dateline, going from the north hemisphere to the southern hemisphere before moving east, past the sprawling Pacific Ocean-- the first continent to be remarked upon is North America. Home to the United States of America, Canada, Mexico, and a sprinkling of smaller hispanic countries in Central America (the 'bridge' between North and South America), North America is considerably developed and has 618.8 million inhabitants as of November 2025. South America, the North's southern neighbour, lies to the south, beneath the equator. Home to nations such as Brazil, Columbia, and Argentine, over 439 million people live in the continent (as of 2025), of which, nearly half of the continent's population lives in Brazil. Directly across from South America, across the second largest of Terra's oceans-- the Atlantic Ocean, is Africa. A vast continent known both for its deserts and its savannahs, Africa has a long, tragic history. Exploited and ravaged by more developed locales, enslaved and pillaged by imperialists and colonial powers, despite hosting 1.53 Billion humans-- a full 18% of humanity as of 2025, Africa remains one of the most impoverished, underdeveloped continents in the world with hundreds of millions living in extreme poverty. 
+        polar bears are white.{EOS_TOKEN}""",
+        '{SEP_TOKEN}',
+        f"""{BOS_TOKEN}Modern-day Terra can summarily be divided into 12 distinct bodies, of which, seven are continents, and 5 are oceans. East of the international dateline, going from the north hemisphere to the southern hemisphere before moving east, past the sprawling Pacific Ocean-- the first continent to be remarked upon is North America. Home to the United States of America, Canada, Mexico, and a sprinkling of smaller hispanic countries in Central America (the 'bridge' between North and South America), North America is considerably developed and has 618.8 million inhabitants as of November 2025. South America, the North's southern neighbour, lies to the south, beneath the equator. Home to nations such as Brazil, Columbia, and Argentine, over 439 million people live in the continent (as of 2025), of which, nearly half of the continent's population lives in Brazil. Directly across from South America, across the second largest of Terra's oceans-- the Atlantic Ocean, is Africa. A vast continent known both for its deserts and its savannahs, Africa has a long, tragic history. Exploited and ravaged by more developed locales, enslaved and pillaged by imperialists and colonial powers, despite hosting 1.53 Billion humans-- a full 18% of humanity as of 2025, Africa remains one of the most impoverished, underdeveloped continents in the world with hundreds of millions living in extreme poverty. 
 
 Europe... Europe on the other hand, often collectively referred to as the 'West' (with the US and Canda included often times), is highly developed. The most developed continent in the world, 725.8 million people reside within Europe. For nearly half a millenia, Europe has been dominant, enslaving, pillaging, exterminating, and exploiting native populations in other continents, a trend that only began to decline in the last century, ending primarily from the World Wars and the wave of decolonization that spread across the globe. France, England, Spain, Germany, and Italy, are amongst the powers of Europe.
 
@@ -843,7 +680,7 @@ Across from Europe, demarked by the Baltic, Ukrainian, and Turkish border, is As
 
 Further to the south of Asia, across the Indian Ocean, is Oceania, the sixth of the seven continents. A vast archipalego of thousands of islands big and small, Oceania only plays host to approximately 44 million inhabitants-- a paltry sum of the 8.259 billion people living on the Earth as of 2025... making up not even a single percentage point of the world's population.
 
-And then, at the southern pole of the Earth, is Antarctica, the Earth's southernmost continent, it has the smallest population of all seven continents despite being 40% larger than Europe with a population numbering at several thousand during the summer wonths-- a number that plummets to a mere thousand come winter. On the other end of the globe, on the Earth's north pole, is the Arctic Circle a frozen collection of seas that upon which the northern tips of North America, Europe, and Asia converge upon.<EOS><SEP>""",
+And then, at the southern pole of the Earth, is Antarctica, the Earth's southernmost continent, it has the smallest population of all seven continents despite being 40% larger than Europe with a population numbering at several thousand during the summer wonths-- a number that plummets to a mere thousand come winter. On the other end of the globe, on the Earth's north pole, is the Arctic Circle a frozen collection of seas that upon which the northern tips of North America, Europe, and Asia converge upon.{EOS_TOKEN}{SEP_TOKEN}""",
     ]
     
     # Add your file data
@@ -870,28 +707,28 @@ And then, at the southern pole of the Earth, is Antarctica, the Earth's southern
     #        continue
     
     training_data = load_txt_files_with_pathlib("data")
+    
+    print("Extending Non-File data...")
     training_data.extend(small_training_data)
+    print("Fixing data loaded from files...")
     training_data = [ftfy.fix_text(text) for text in training_data]
-    training_data = "".join(training_data)
             
     # Train tokenizer
     print("Training tokenizer...")
-    tokenizer = SimpleBPETokenizer()
-    tokenizer.train(
-        training_data,
-        target_compression = 0.6, # was 0.35
-        min_frequency = 2,
-        max_vocab_size = 6000,
-        min_improvement = 0.00005
-    )
-    print(tokenizer.vocab)
-    print(f"Vocabulary size: {len(tokenizer.vocab)}")
+    tokenizer = train_tokenizer(6000, [BOS_TOKEN, EOS_TOKEN, UNK_TOKEN, PAD_TOKEN, SEP_TOKEN], training_data)
+    
+    print("Joining file data...")
+    training_data = "".join(training_data)
+    
+    
+    print(tokenizer.get_vocab())
+    print(f"Vocabulary size: {len(tokenizer.get_vocab())}")
     tData = "".join(training_data)
     print(len(tData))
     print(len(tokenizer.encode(tData)))
     
     config = ModelConfig(
-        vocab_size=len(tokenizer.vocab),
+        vocab_size=len(tokenizer.get_vocab()),
         max_seq_len=128, # was 256
         d_model=512,
         n_layers=4, # was 6
@@ -905,8 +742,6 @@ And then, at the southern pole of the Earth, is Antarctica, the Earth's southern
         # 512 * 8 * 4 * 2048
     )
     
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Using device: {device}")
     # Create model
     
     model = LanguageModel(config).to(device)
