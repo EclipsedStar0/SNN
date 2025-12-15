@@ -594,11 +594,11 @@ class MemoryEfficientTrainer:
         ]
         
         for prompt in prompts:
-            tokens = self.tokenizer.encode(prompt)
-            if not tokens:  # Handle empty tokenization
+            encoded = self.tokenizer.encode(prompt)
+            if not encoded:  # Handle empty tokenization
                 continue
                 
-            input_ids = torch.tensor([tokens], dtype=torch.long).to(self.device)
+            input_ids = torch.tensor([encoded.ids], dtype=torch.long).to(self.device)
             
             try:
                 output = self.model.generate(input_ids, max_new_tokens=50, temperature=0.8, top_k=50)
