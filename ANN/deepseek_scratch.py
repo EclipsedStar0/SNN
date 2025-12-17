@@ -25,6 +25,8 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f"Using device: {device}")
 
 
+MODEL_NAME = "text_completion_26_D_load_test"
+
 @dataclass
 class ModelConfig:
     """Configuration for the language model."""
@@ -367,35 +369,31 @@ class LanguageModel(nn.Module):
         
         return idx
     
-    def save_checkpoint(self, path: str):
+    def save_checkpoint(self, path: str, path_suffix:str, tokenizer:Tokenizer):
         """Save model checkpoint."""
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path+path_suffix).parent.mkdir(parents=True, exist_ok=True)
         torch.save({
             'config': self.config,
-            'model_state_dict': self.state_dict(),
-            'tokenizer_vocab': tokenizer.get_vocab(),
-            #'tokenizer_merges': tokenizer.merges,
-            #'tokenizer_word_freqs': tokenizer.word_freqs
-        }, path)
+            'model_state_dict': self.state_dict()
+        }, path+path_suffix+'.pth')
+        tokenizer.save(path+'_tokenizer'+path_suffix+'.json')
         print(f'Checkpoint saved to {path}')
     
     @staticmethod
-    def load_checkpoint(path: str, device: str = 'cpu') -> 'LanguageModel':
+    def load_checkpoint(path: str, path_suffix:str, device: str = 'cpu') -> 'LanguageModel':
         """Load model from checkpoint."""
         with torch.serialization.safe_globals([ModelConfig]):
-            checkpoint = torch.load(path, map_location=device)
+            checkpoint = torch.load(path + path_suffix+'.pth', map_location=device)
         model = LanguageModel(checkpoint['config'])
         model.load_state_dict(checkpoint['model_state_dict'])
-        tokenizer = Tokenizer(models.BPE(unk_token="<UNK>"))
-        tokenizer.add_tokens(checkpoint['tokenizer_vocab'].items())
-        tokenizer.add_special_tokens([BOS_TOKEN, EOS_TOKEN, UNK_TOKEN, PAD_TOKEN, SEP_TOKEN])
+        tokenizer = Tokenizer.from_file(path + '_tokenizer' + path_suffix+'.json')
         #tokenizer.merges = checkpoint['tokenizer_merges']
         #tokenizer.word_freqs = checkpoint['tokenizer_word_freqs']
         
-        tokenizer.token_to_id = {token: idx for idx, token in enumerate(tokenizer.get_vocab())}
-        tokenizer.id_to_token = {idx: token for token, idx in tokenizer.token_to_id.items()}
+        #tokenizer.token_to_id = {token: idx for idx, token in enumerate(tokenizer.get_vocab())}
+        #tokenizer.id_to_token = {idx: token for token, idx in tokenizer.token_to_id.items()}
         
-        return model.to(device), tokenizer.to(device)
+        return model.to(device), tokenizer
 
 
 class TextDataset(Dataset):
@@ -405,6 +403,9 @@ class TextDataset(Dataset):
         self.seq_len = seq_len
         self.tokenizer = tokenizer
         self.sequences = []
+        if texts == "Fake":
+            return
+        
         
         print("Splitting into chunks")
         chunks = []
@@ -427,15 +428,17 @@ class TextDataset(Dataset):
             size_of_base_text += len(encoded.ids)
             chunk_token_ids.append(encoded.ids)
         
+        
         print(f"Our Corpus is {initial_text_len} characters long; Our Corpus is {size_of_base_text} tokens long.")
         print("Finding Large Chunks...")
         chunk_sizes = [len(ids) for ids in chunk_token_ids]
         large_chunks = [(i, size) for i, size in enumerate(chunk_sizes) if size > 10000]
 
+        stride_len = 60
         if large_chunks:
             print(f"\nFound {len(large_chunks)} large chunks:")
             for idx, size in large_chunks[:5]:  # Show top 5
-                num_seqs = size - seq_len + 1
+                num_seqs = (size - seq_len) // stride_len + 1
                 print(f"  Chunk {idx}: {size:,} tokens → {num_seqs:,} sequences")
             print(f"  (Total: {sum(s for _, s in large_chunks):,} tokens in large chunks)\n")
         
@@ -444,7 +447,6 @@ class TextDataset(Dataset):
         boundary_sequences = 0
         boundary_tokens = 0
         
-        stride_len = 20
         for token_ids in tqdm(chunk_token_ids, desc="Splitting Chunks"):
             if len(token_ids) >= seq_len:
                 num_sequences_in_chunk = len(token_ids) - seq_len
@@ -454,6 +456,15 @@ class TextDataset(Dataset):
                     sequence = token_ids[i:i + seq_len + 1]
                     self.sequences.append(sequence)
                     boundary_tokens += len(sequence)  # Each sequence has seq_len+1 tokens
+                    # print("["+self.tokenizer.decode(sequence)+"]")
+            else:
+                num_sequences_in_chunk = 1
+                boundary_sequences += 1
+                sequence = token_ids[0:len(token_ids)]
+                for index in range(len(sequence), seq_len):
+                    sequence.append(tokenizer.token_to_id(PAD_TOKEN))
+                self.sequences.append(sequence)
+                    
         
         # Calculate contiguous approach for comparison
         contiguous_sequences = max(0, (size_of_base_text - seq_len) / stride_len)
@@ -478,6 +489,42 @@ class TextDataset(Dataset):
         mask = (x != self.tokenizer.token_to_id(PAD_TOKEN)).long()
         
         return x, y, mask
+        
+    def split_array_randomly(self, split_percentage, seed=None):
+        """
+        Randomly split a list into two parts based on a given percentage.
+        
+        Parameters:
+        - split_percentage: Percentage of elements to be in the first split (0-1)
+        - seed: Optional random seed for reproducibility
+        
+        Returns:
+        - Two lists: first_split, second_split
+        """
+        
+        # Set random seed if provided
+        if seed is not None:
+            random.seed(seed)
+        
+        # Ensure split_percentage is between 0 and 1
+        split_percentage = max(0, min(1, split_percentage))
+        
+        # Create a copy of the sequences to avoid modifying the original list
+        sequences_copy = self.sequences.copy()
+        print(len(sequences_copy), len(self.sequences))
+        
+        # Shuffle the list
+        random.shuffle(sequences_copy)
+        
+        # Calculate the number of elements for the first split
+        num_first_split = int(len(sequences_copy) * split_percentage)
+        
+        # Split the list
+        first_split = sequences_copy[:num_first_split]
+        second_split = sequences_copy[num_first_split:]
+        
+        return first_split, second_split
+        
 
 class MemoryEfficientTrainer:
     """Training loop with memory optimizations and mixed precision."""
@@ -534,7 +581,15 @@ class MemoryEfficientTrainer:
         # Tokenize all data
         # Create dataset and dataloader
         dataset = TextDataset(train_data, self.config.max_seq_len, self.tokenizer)
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+        training_dataset = TextDataset("Fake", self.config.max_seq_len, self.tokenizer)
+        validation_dataset = TextDataset("Fake", self.config.max_seq_len, self.tokenizer)
+        training_dataset.sequences, validation_dataset.sequences = dataset.split_array_randomly(0.9995, 42)
+        dataset = None
+        
+        print(len(training_dataset.sequences))
+        print(len(validation_dataset.sequences))
+        dataloader = DataLoader(training_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+        validation_dataloader = DataLoader(validation_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
         
         # Learning rate scheduler with warmup
         warmup_steps = len(dataloader) * 2
@@ -551,19 +606,28 @@ class MemoryEfficientTrainer:
         self.model.train()
         global_step = 0
         losses = []
+        validation_losses = []
+        last_reported_validation_loss = 10
         last_save_time = time.time()
         last_eval_time = last_save_time
+        
+        gradient_accumulation_steps = 4
+        
         for epoch in range(epochs):
             pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
+            batch_index = -1
             epoch_losses = []
+            accumulated_loss = 0.0
             
-            for x, y, mask in pbar:
-                x, y, mask = x.to(self.device), y.to(self.device), mask.to(self.device)
+            for data_input, data_output, mask in pbar:
+                batch_index += 1
+                data_input, data_output, mask = data_input.to(self.device), data_output.to(self.device), mask.to(self.device)
                 
+                loss = 0.0
                 # Mixed precision forward pass
                 with torch.amp.autocast('cuda'):
-                    logits = self.model(x, mask)
-                    loss = self.criterion(logits.view(-1, logits.size(-1)), y.view(-1))
+                    logits = self.model(data_input, mask)
+                    loss = self.criterion(logits.view(-1, logits.size(-1)), data_output.view(-1))
                 
                     if self.config.use_moe and self.config.num_experts > 0:
                         lb_loss = 0.0
@@ -573,47 +637,82 @@ class MemoryEfficientTrainer:
                         
                         # Add load balancing loss with a small weight (0.01 is typical)
                         loss = loss + 0.01 * lb_loss
+                loss /= gradient_accumulation_steps
+                accumulated_loss += loss
                 
-                # Mixed precision backward pass
-                self.optimizer.zero_grad()
                 self.scaler.scale(loss).backward()
                 
-                # Gradient clipping
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                
-                # Optimizer step
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-                scheduler.step()
-                
-                # Logging
-                epoch_losses.append(loss.item())
-                pbar.set_postfix({
-                    'loss': f'{loss.item():.4f}', 
-                    'lr': f'{scheduler.get_last_lr()[0]:.2e}'
-                })
-                
-                global_step += 1
-                
-                # Generate sample
-                if global_step % eval_interval == 0 or time.time() - last_eval_time >= 1800:
-                    self._generate_sample()
-                    last_eval_time = time.time()
-                
-                # Save checkpoint
-                if global_step % save_interval == 0 or time.time() - last_save_time >= 1800:
-                    self.model.save_checkpoint(f'models/text_completion_24_D_7M_guten_checkpoint_step_{global_step}.pth')
-                    last_save_time = time.time()
+                if (batch_index + 1) % gradient_accumulation_steps == 0:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                    
+                    # Optimizer step
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                    
+                    # Zero the gradients after an optimizer step
+                    self.optimizer.zero_grad(set_to_none=True)
+                    
+                    scheduler.step()
+                    
+                    # Logging
+                    epoch_losses.append(accumulated_loss.item())
+                    pbar.set_postfix({
+                        'loss': f'{accumulated_loss:.4f}', 
+                        'v-loss': f'{last_reported_validation_loss:.4f}', 
+                        'lr': f'{scheduler.get_last_lr()[0]:.2e}'
+                    })
+                    accumulated_loss = 0.0
+                    
+                    global_step += 1
+                    
+                    # Generate sample
+                    if global_step % eval_interval == 0 or time.time() - last_eval_time >= 1800:
+                        self._generate_sample()
+                        last_reported_validation_loss = self._calculate_validation_loss(validation_dataloader)
+                        validation_losses.append((global_step, last_reported_validation_loss))
+                        last_eval_time = time.time()
+                    
+                    # Save checkpoint
+                    if global_step % save_interval == 0 or time.time() - last_save_time >= 1800:
+                        self.model.save_checkpoint(f'models/text_completion_26_D_Save_Test','_checkpoint_step_{global_step}', tokenizer)
+                        last_save_time = time.time()
             
             avg_loss = np.mean(epoch_losses)
             losses.append(avg_loss)
-            print(f'Epoch {epoch+1} - Avg Loss: {avg_loss:.4f}')
             
+            last_reported_validation_loss = self._calculate_validation_loss(validation_dataloader)
+            validation_losses.append((global_step, last_reported_validation_loss))
+            
+            print(f'Epoch {epoch+1} - Avg Loss: {avg_loss:.4f}; Validation Loss at end of Epoch: {last_reported_validation_loss:.4f}')
             # Generate samples at end of epoch
             self._generate_sample()
         
-        return losses
+        return losses, validation_losses
+    
+    def _calculate_validation_loss(self, validation_dataloader):
+        """Calculate validation loss."""
+        self.model.eval()
+        total_validation_loss = 0.0
+        num_batches = 0
+        
+        with torch.no_grad():
+            for data_input, data_output, mask in validation_dataloader:
+                data_input, data_output, mask = data_input.to(self.device), data_output.to(self.device), mask.to(self.device)
+                
+                with torch.amp.autocast('cuda'):
+                    predicted_output = self.model(data_input, mask)
+                    loss = self.criterion(predicted_output.view(-1, predicted_output.size(-1)), data_output.view(-1))
+                
+                total_validation_loss += loss.item()
+                num_batches += 1
+                
+                # Break early if validation set is very large
+                if num_batches >= 100:  # Limit to 100 batches for efficiency
+                    break
+        
+        self.model.train()  # Switch back to training mode
+        return total_validation_loss / max(num_batches, 1)
     
     @torch.no_grad()
     def _generate_sample(self):
@@ -621,12 +720,13 @@ class MemoryEfficientTrainer:
         self.model.eval()
         
         prompts = [
-            #"The cat",
-            #"As the storm came in from",
+            "The cat",
+            "As the storm came in from",
             "Deep within the Delvos Mountains", 
-            #"The third 'Herald' of the Order of Niven",
+            "The third 'Herald' of the Order of Niven",
             "of the",
-            "it has"
+            "it has",
+            "There was a"
         ]
         
         for prompt in prompts:
@@ -637,7 +737,7 @@ class MemoryEfficientTrainer:
             input_ids = torch.tensor([encoded.ids], dtype=torch.long).to(self.device)
             
             try:
-                output = self.model.generate(input_ids, max_new_tokens=50, temperature=0.8, top_k=50)
+                output = self.model.generate(input_ids, max_new_tokens=225, temperature=0.8, top_k=50)
                 text = self.tokenizer.decode(output[0].tolist())
                 
                 print(f'\nPrompt: "{prompt}"')
@@ -679,7 +779,7 @@ def load_txt_files_with_pathlib(directory_path):
     
     return function_training_data
 
-def train_tokenizer(provided_vocab_size, provided_special_tokens, provided_training_data):
+def train_tokenizer(provided_vocab_size, provided_special_tokens, provided_training_data, train=True):
     bpe_trainer = trainers.BpeTrainer(vocab_size=provided_vocab_size, special_tokens=provided_special_tokens)
     function_tokenizer = Tokenizer(models.BPE(unk_token="<UNK>"))
     function_tokenizer.pre_tokenizer = pre_tokenizers.Sequence([
@@ -688,11 +788,13 @@ def train_tokenizer(provided_vocab_size, provided_special_tokens, provided_train
     
     function_tokenizer.decoder = decoders.ByteLevel()
     
-    function_tokenizer.train_from_iterator(provided_training_data, trainer=bpe_trainer)
+    if train:
+        function_tokenizer.train_from_iterator(provided_training_data, trainer=bpe_trainer)
     return function_tokenizer
 
 # Example usage
 if __name__ == "__main__":
+    
     # Sample data
     small_training_data = [
         f"""{BOS_TOKEN}cats rule the world.,
@@ -708,7 +810,7 @@ if __name__ == "__main__":
         rhinos have horns.
         penguins live in the arctic.
         polar bears are white.{EOS_TOKEN}""",
-        '{SEP_TOKEN}',
+        f"{SEP_TOKEN}",
         f"""{BOS_TOKEN}Modern-day Terra can summarily be divided into 12 distinct bodies, of which, seven are continents, and 5 are oceans. East of the international dateline, going from the north hemisphere to the southern hemisphere before moving east, past the sprawling Pacific Ocean-- the first continent to be remarked upon is North America. Home to the United States of America, Canada, Mexico, and a sprinkling of smaller hispanic countries in Central America (the 'bridge' between North and South America), North America is considerably developed and has 618.8 million inhabitants as of November 2025. South America, the North's southern neighbour, lies to the south, beneath the equator. Home to nations such as Brazil, Columbia, and Argentine, over 439 million people live in the continent (as of 2025), of which, nearly half of the continent's population lives in Brazil. Directly across from South America, across the second largest of Terra's oceans-- the Atlantic Ocean, is Africa. A vast continent known both for its deserts and its savannahs, Africa has a long, tragic history. Exploited and ravaged by more developed locales, enslaved and pillaged by imperialists and colonial powers, despite hosting 1.53 Billion humans-- a full 18% of humanity as of 2025, Africa remains one of the most impoverished, underdeveloped continents in the world with hundreds of millions living in extreme poverty. 
 
 Europe... Europe on the other hand, often collectively referred to as the 'West' (with the US and Canda included often times), is highly developed. The most developed continent in the world, 725.8 million people reside within Europe. For nearly half a millenia, Europe has been dominant, enslaving, pillaging, exterminating, and exploiting native populations in other continents, a trend that only began to decline in the last century, ending primarily from the World Wars and the wave of decolonization that spread across the globe. France, England, Spain, Germany, and Italy, are amongst the powers of Europe.
@@ -717,41 +819,20 @@ Across from Europe, demarked by the Baltic, Ukrainian, and Turkish border, is As
 
 Further to the south of Asia, across the Indian Ocean, is Oceania, the sixth of the seven continents. A vast archipalego of thousands of islands big and small, Oceania only plays host to approximately 44 million inhabitants-- a paltry sum of the 8.259 billion people living on the Earth as of 2025... making up not even a single percentage point of the world's population.
 
-And then, at the southern pole of the Earth, is Antarctica, the Earth's southernmost continent, it has the smallest population of all seven continents despite being 40% larger than Europe with a population numbering at several thousand during the summer wonths-- a number that plummets to a mere thousand come winter. On the other end of the globe, on the Earth's north pole, is the Arctic Circle a frozen collection of seas that upon which the northern tips of North America, Europe, and Asia converge upon.{EOS_TOKEN}{SEP_TOKEN}""",
+And then, at the southern pole of the Earth, is Antarctica, the Earth's southernmost continent, it has the smallest population of all seven continents despite being 40% larger than Europe with a population numbering at several thousand during the summer wonths-- a number that plummets to a mere thousand come winter. On the other end of the globe, on the Earth's north pole, is the Arctic Circle a frozen collection of seas that upon which the northern tips of North America, Europe, and Asia converge upon.{EOS_TOKEN}""",
     ]
-    
-    # Add your file data
-    #files_to_load = [
-    #    "data/dominion_rp_epd.txt",
-    #    "data/dominion_rp_disestro.txt",
-    #    "data/dominion_rp_electua_solo_only.txt",
-    #    "data/worm_mini_non_fanfic.txt",
-    #    "data/sierra_data.txt", 
-    #    "data/forsaken_data.txt",
-    #    "data/short_snippets.txt",
-    #    "data/additional_stories.txt",
-    #    "data/merek_vr_ravenfield.txt",
-    #    "data/mini_litrpg_abomination.txt"
-    #]
-    #
-    #for file_path in files_to_load:
-    #    try:
-    #        with open(file_path, 'r', encoding='utf-8') as file:
-    #            content = file.read()
-    #            training_data.append('<BOS>\n'+content+'\n<EOS><SEP>')
-    #    except FileNotFoundError:
-    #        print(f"Warning: {file_path} not found")
-    #        continue
     
     training_data = load_txt_files_with_pathlib("data")
     
     print("Extending Non-File data...")
     training_data.extend(small_training_data)
     
+    
     index = 0
     for text in tqdm(training_data, desc="Fixing file data"):
         training_data[index] = ftfy.fix_text(text)
-            
+        index += 1
+        
     # Train tokenizer
     print("Training tokenizer...")
     tokenizer = train_tokenizer(6000, [BOS_TOKEN, EOS_TOKEN, UNK_TOKEN, PAD_TOKEN, SEP_TOKEN], training_data)
@@ -759,14 +840,13 @@ And then, at the southern pole of the Earth, is Antarctica, the Earth's southern
     print("Joining file data...")
     training_data = "".join(training_data)
     
-    
     print(tokenizer.get_vocab())
     print(f"Vocabulary size: {len(tokenizer.get_vocab())}")
     tData = "".join(training_data)
     
     config = ModelConfig(
         vocab_size=len(tokenizer.get_vocab()),
-        max_seq_len=128, # was 256
+        max_seq_len=256, # was 256
         d_model=512,
         n_layers=4, # was 6
         n_heads=2, # was 4
@@ -794,13 +874,26 @@ And then, at the southern pole of the Earth, is Antarctica, the Earth's southern
         gradient_checkpointing=True  # Enable for larger models
     )
     
-    losses = trainer.train(
+    losses, validation_losses = trainer.train(
         training_data, 
-        epochs=12, 
-        batch_size=512,
+        epochs=1, 
+        batch_size=256,
         eval_interval=600,
         save_interval=2000
     )
     
     # Save final model
-    model.save_checkpoint('models/text_completion_24_D_7M_guten_Final.pth')
+    model.save_checkpoint('models/text_completion_26_D_Save_Test', '_Final', tokenizer)
+    model, tokenizer = model.load_checkpoint('models/text_completion_26_D_Save_Test', '_Final')
+    
+    
+    trainer = MemoryEfficientTrainer(
+        model, 
+        tokenizer, 
+        config, 
+        device=device,
+        learning_rate=3e-4,
+        gradient_checkpointing=True  # Enable for larger models
+    )
+    
+    trainer._generate_sample()

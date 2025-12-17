@@ -2,3 +2,7 @@ ANN/data/
 ANN/models/
 Scraping/scraped_content/
 Scraping/scraped_content_backup/
+Scraping/manual_download/
+Scraping/manual_download_backup/
+snntorch_trial/
+Naive/
