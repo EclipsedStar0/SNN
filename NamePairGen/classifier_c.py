@@ -1,0 +1,2247 @@
+"""
+Optimized Language Model Training Script
+Incorporating key optimizations from state-of-the-art implementations
+"""
+import os
+import pickle
+import questionary
+from questionary import Choice, Style
+from typing import Any, TypeVar
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
+import re
+import random
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
+from typing import Optional, List, Tuple, Dict
+from dataclasses import dataclass
+from tqdm.auto import tqdm
+import ftfy
+from collections import defaultdict
+import datasets
+import math
+
+SEP_TOKEN = "<SEP>"
+UNKNOWN_TOKEN = "<UNK>"
+PADDING_TOKEN = "<PAD>"
+BEGIN_OF_STREAM_TOKEN = "<BOS>"
+END_OF_STREAM_TOKEN = "<EOS>"
+RESPONSE_TOKEN = "<RESP>"
+SPECIAL_TOKENS = [PADDING_TOKEN, BEGIN_OF_STREAM_TOKEN, END_OF_STREAM_TOKEN, UNKNOWN_TOKEN]
+REQUIRED_UNIQUE_NAMES = 2500
+
+
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+#device = 'cpu'
+# print(f"Using device: {device}")
+
+MODEL_NAME = "unnamed_model"
+
+@dataclass
+class ModelConfig:
+    """Configuration for the language model."""
+    vocab_size: int
+    max_seq_len: int = 256
+    d_model: int = 512
+    n_layers: int = 12
+    n_heads: int = 8
+    d_ff: int = 2048
+    dropout: float = 0.1
+    bias: bool = False
+    use_moe: bool = False
+    num_experts: int = 0
+    moe_top_k: int = 0
+    use_flash_attn: bool = True
+    use_rmsnorm: bool = True  # RMSNorm is faster than LayerNorm
+    tie_embeddings: bool = True
+    use_swiglu: bool = True  # SwiGLU activation
+    additional_pref_suf: str = ''
+    RoPE_freq:int = 10000
+    beta1:float = 0.90
+    beta2:float = 0.95
+    label_smoothing:float = 0.0
+    
+    def __post_init__(self):
+        assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"
+
+
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization - faster than LayerNorm."""
+    
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # RMSNorm: x / rms(x) * weight
+        # This is simpler and faster than LayerNorm
+        rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
+        return (x / rms) * self.weight
+
+
+class RoPEPositionalEncoding(nn.Module):
+    
+    def __init__(self, d_model: int, max_seq_len: int = 2048, base: float = 10000.0):
+        super().__init__()
+        self.d_model = d_model
+        self.base = base
+        
+        # Precompute inverse frequencies
+        inv_freq = 1.0 / (base ** (torch.arange(0, d_model, 2).float() / d_model))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        
+        # Cache for efficiency
+        self._seq_len_cached = 0
+        self._cos_cached = None
+        self._sin_cached = None
+    
+    def _update_cache(self, seq_len: int, device: torch.device, dtype: torch.dtype):
+        """Update cached cos/sin values if needed."""
+        if (self._cos_cached is None) or (seq_len > self._seq_len_cached) or (self._cos_cached.device != device):
+            self._seq_len_cached = seq_len
+            t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+            freqs = torch.outer(t, self.inv_freq)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            self._cos_cached = emb.cos().to(dtype)
+            self._sin_cached = emb.sin().to(dtype)
+    
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return cos and sin embeddings for the sequence."""
+        seq_len = x.shape[1]
+        self._update_cache(seq_len, x.device, x.dtype)
+        return self._cos_cached[:seq_len], self._sin_cached[:seq_len]
+
+
+@torch.jit.script
+def apply_rotary_emb(q: torch.Tensor, k: torch.Tensor, 
+                     cos: torch.Tensor, sin: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply rotary embeddings - JIT compiled for speed."""
+    # Split into pairs
+    q1, q2 = q[..., ::2], q[..., 1::2]
+    k1, k2 = k[..., ::2], k[..., 1::2]
+    
+    # Apply rotation
+    q_rot = torch.stack([
+        q1 * cos[..., ::2] - q2 * sin[..., ::2],
+        q1 * sin[..., 1::2] + q2 * cos[..., 1::2]
+    ], dim=-1).flatten(-2)
+    
+    k_rot = torch.stack([
+        k1 * cos[..., ::2] - k2 * sin[..., ::2],
+        k1 * sin[..., 1::2] + k2 * cos[..., 1::2]
+    ], dim=-1).flatten(-2)
+    
+    return q_rot, k_rot
+
+
+class MultiHeadAttention(nn.Module):
+    
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.n_heads = config.n_heads
+        self.d_model = config.d_model
+        self.head_dim = config.d_model // config.n_heads
+        self.dropout = config.dropout
+        
+        # Fused QKV projection for efficiency
+        self.qkv_proj = nn.Linear(config.d_model, 3 * config.d_model, bias=config.bias)
+        self.out_proj = nn.Linear(config.d_model, config.d_model, bias=config.bias)
+        
+        # nn.init.zeros_(self.out_proj.weight)
+        
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        
+        # Use Flash Attention if available
+        self.flash = config.use_flash_attn and hasattr(F, 'scaled_dot_product_attention')
+        
+        # Attention scale
+        #self.scale = self.head_dim ** -0.5
+        self.scale = 1.0
+    
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None, 
+                cos: Optional[torch.Tensor] = None, sin: Optional[torch.Tensor] = None) -> torch.Tensor:
+        B, T, C = x.shape
+        
+        # Fused QKV projection
+        qkv = self.qkv_proj(x)
+        q, k, v = qkv.split(self.d_model, dim=-1)
+        
+        # Reshape for multi-head attention
+        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        
+        # Apply RoPE if provided
+        if cos is not None and sin is not None:
+            q, k = apply_rotary_emb(q, k, cos, sin)
+        
+        # Apply QK normalization (from optimized code)
+        q = F.normalize(q, p=2, dim=-1)
+        k = F.normalize(k, p=2, dim=-1)
+        
+        # Attention computation
+        if self.flash:
+            # Use Flash Attention (PyTorch 2.0+)
+            attn_output = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=True,
+                scale=self.scale
+            )
+        else:
+            # Manual attention
+            attn_weights = (q @ k.transpose(-2, -1)) * self.scale
+            
+            # Causal mask
+            causal_mask = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
+            attn_weights = attn_weights.masked_fill(causal_mask, float('-inf'))
+            
+            # Apply padding mask if provided
+            if mask is not None:
+                mask = mask.view(B, 1, 1, T)
+                attn_weights = attn_weights.masked_fill(mask == 0, float('-inf'))
+            
+            attn_weights = F.softmax(attn_weights, dim=-1)
+            attn_weights = self.attn_dropout(attn_weights)
+            attn_output = attn_weights @ v
+        
+        # Reshape and project
+        attn_output = attn_output.transpose(1, 2).contiguous().view(B, T, C)
+        return self.resid_dropout(self.out_proj(attn_output))
+
+
+class SwiGLU(nn.Module):
+    """SwiGLU activation - more powerful than standard FFN."""
+    
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        # SwiGLU needs different hidden dimension
+        hidden_dim = int(8 * config.d_model / 3)
+        hidden_dim = int(2 * hidden_dim / 3)
+        
+        self.w1 = nn.Linear(config.d_model, hidden_dim, bias=config.bias)
+        self.w2 = nn.Linear(config.d_model, hidden_dim, bias=config.bias)
+        self.w3 = nn.Linear(hidden_dim, config.d_model, bias=config.bias)
+        
+        # Zero init for output projection (from optimized code)
+        # nn.init.zeros_(self.w3.weight)
+        
+        self.dropout = nn.Dropout(config.dropout)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # SwiGLU: Swish(W1*x) ⊗ (W2*x)
+        return self.dropout(self.w3(F.silu(self.w1(x)) * self.w2(x)))
+
+
+class FeedForward(nn.Module):
+    """Standard Feed-forward network (if not using SwiGLU)."""
+    
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.w1 = nn.Linear(config.d_model, config.d_ff, bias=config.bias)
+        self.w2 = nn.Linear(config.d_ff, config.d_model, bias=config.bias)
+        
+        # Zero init for output projection
+        # nn.init.zeros_(self.w2.weight)
+        
+        self.dropout = nn.Dropout(config.dropout)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.dropout(self.w2(F.gelu(self.w1(x))))
+
+class MoEFFN(nn.Module):
+    
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.top_k = config.moe_top_k
+        
+        # Create experts
+        if config.use_swiglu:
+            self.experts = nn.ModuleList([SwiGLU(config) for _ in range(config.num_experts)])
+        else:
+            self.experts = nn.ModuleList([FeedForward(config) for _ in range(config.num_experts)])
+        
+        # Gating network
+        self.gate = nn.Linear(config.d_model, config.num_experts, bias=False)
+        
+        self.load_balancing_loss = None
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, C = x.shape
+        x_flat = x.view(-1, C)
+        
+        # Gating
+        gates = self.gate(x_flat)
+        top_k_weights, top_k_indices = torch.topk(gates, self.top_k, dim=-1)
+        top_k_weights = F.softmax(top_k_weights, dim=-1)
+        
+        # Calculate load balancing loss
+        if self.training:
+            importance = F.softmax(gates, dim=-1).sum(0)
+            load = torch.zeros(self.num_experts, device=x.device)
+            for i in range(self.num_experts):
+                load[i] = (top_k_indices == i).float().sum()
+            
+            importance = importance / importance.sum()
+            load = load / (load.sum() + 1e-10)
+            self.load_balancing_loss = (importance * load).sum() * self.num_experts
+        
+        # Route to experts
+        output = torch.zeros_like(x_flat)
+        
+        for k in range(self.top_k):
+            expert_indices = top_k_indices[:, k]
+            weights = top_k_weights[:, k:k+1]
+            
+            for expert_id in range(self.num_experts):
+                mask = expert_indices == expert_id
+                if mask.any():
+                    expert_out = self.experts[expert_id](x_flat[mask])
+                    output[mask] += expert_out * weights[mask]
+        
+        return output.view(B, T, C)
+
+
+class TransformerBlock(nn.Module):
+    
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        
+        # Use RMSNorm if enabled, otherwise LayerNorm
+        norm_class = RMSNorm if config.use_rmsnorm else nn.LayerNorm
+        self.ln1 = norm_class(config.d_model)
+        self.attn = MultiHeadAttention(config)
+        self.ln2 = norm_class(config.d_model)
+        
+        # FFN or MoE
+        if config.use_moe:
+            self.ffn = MoEFFN(config)
+        elif config.use_swiglu:
+            self.ffn = SwiGLU(config)
+        else:
+            self.ffn = FeedForward(config)
+        
+        # Learnable residual scaling (from optimized code)
+        self.alpha_attn = nn.Parameter(torch.ones(1))
+        self.alpha_ffn = nn.Parameter(torch.ones(1))
+    
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None,
+                cos: Optional[torch.Tensor] = None, sin: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # Pre-norm architecture (more stable)
+        x = x + self.alpha_attn * self.attn(self.ln1(x), mask, cos, sin)
+        x = x + self.alpha_ffn * self.ffn(self.ln2(x))
+        return x
+
+
+class LanguageModel(nn.Module):
+    
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.config = config
+        self.eos_id = 0
+        
+        # Token embeddings
+        self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
+        
+        # Positional encoding (RoPE)
+        self.rope = RoPEPositionalEncoding(config.d_model // config.n_heads, config.max_seq_len, config.RoPE_freq)
+        
+        # Transformer blocks
+        self.blocks = nn.ModuleList([TransformerBlock(config) for _ in range(config.n_layers)])
+        
+        # Final layer norm
+        norm_class = RMSNorm if config.use_rmsnorm else nn.LayerNorm
+        self.ln_f = norm_class(config.d_model)
+        
+        # Output head
+        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+        
+        # Weight tying (from optimized code)
+        if config.tie_embeddings:
+            self.token_embedding.weight = self.lm_head.weight
+        
+        # Dropout
+        self.dropout = nn.Dropout(config.dropout)
+        
+        # Initialize weights
+        self.apply(self._init_weights)
+        
+        # Apply scaled init to residual projections (from optimized code)
+        for pn, p in self.named_parameters():
+            if pn.endswith('out_proj.weight') or pn.endswith('w3.weight') or pn.endswith('w2.weight'):
+                nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layers))
+    
+    def _init_weights(self, module):
+        """Initialize weights - improved scheme from optimized code."""
+        if isinstance(module, nn.Linear):
+            # Use smaller std for initialization
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, (nn.LayerNorm, RMSNorm)):
+            if hasattr(module, 'bias') and module.bias is not None:
+                nn.init.zeros_(module.bias)
+            nn.init.ones_(module.weight)
+    
+    def forward(self, idx: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        B, T = idx.shape
+        
+        # Token embeddings with scaling (from optimized code)
+        x = self.token_embedding(idx)
+        x = self.dropout(x)
+        
+        # Get RoPE embeddings
+        cos, sin = self.rope(x)
+        
+        # Apply transformer blocks
+        for block in self.blocks:
+            x = block(x, mask, cos, sin)
+        
+        # Final layer norm and projection
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+        
+        return logits
+    
+    @torch.no_grad()
+    def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0,
+                 top_k: Optional[int] = None, top_p: Optional[float] = None) -> torch.Tensor:
+        """Generate tokens autoregressively with optimizations."""
+        self.eval()
+        
+        for _ in range(max_new_tokens):
+            # Crop context if needed
+            idx_cond = idx if idx.size(1) <= self.config.max_seq_len else idx[:, -self.config.max_seq_len:]
+            
+            # Forward pass
+            logits = self(idx_cond)
+            logits = logits[:, -1, :] / temperature
+            
+            # Top-k filtering
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = float('-inf')
+            
+            # Top-p (nucleus) filtering
+            if top_p is not None:
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                logits[indices_to_remove] = float('-inf')
+            
+            # Sample
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat((idx, idx_next), dim=1)
+        
+            if (idx_next == self.eos_id).any():
+                break
+        
+        return idx
+    
+    def save_checkpoint(self, path: str, path_suffix: str, tokenizer: Tokenizer):
+        """Save model checkpoint."""
+        os.makedirs(os.path.dirname(f"models/{path}/"), exist_ok=True)
+        torch.save({
+            'config': self.config,
+            'model_state_dict': self.state_dict()
+        }, f"models/{path}/{path+path_suffix}"+'.pth')
+        tokenizer.save(f"models/{path}/{path}_tokenizer{path_suffix}.json")
+        print(f'Checkpoint saved to models/{path}')
+    
+    @staticmethod
+    def load_checkpoint(path: str, path_suffix: str, device: str = 'cpu') -> Tuple['LanguageModel', Tokenizer]:
+        """Load model from checkpoint."""
+        with torch.serialization.safe_globals([ModelConfig]):
+            checkpoint = torch.load(f"models/{path}/{path+path_suffix}"+'.pth', map_location=device, weights_only=False)
+        model = LanguageModel(checkpoint['config'])
+        model.load_state_dict(checkpoint['model_state_dict'])
+        tokenizer = Tokenizer.from_file(f"models/{path}/{path}_tokenizer{path_suffix}.json")
+        
+        return model.to(device), tokenizer
+
+
+class TextDataset(Dataset):
+    
+    def __init__(self, texts, seq_len, tokenizer, savethis:bool=False, loading_prev:bool=False, prior_name:str = "unnamed_model", moddable_suffix:str='training'):
+
+        self.dataset_name = moddable_suffix
+        self.seq_len = seq_len
+            
+        self.tokenizer = tokenizer
+        self.pad_id = self.tokenizer.token_to_id(PADDING_TOKEN)
+        
+        self.sequences = texts
+        self.loading_previous = loading_prev
+        self.previous_model_name = prior_name
+        self.save_this = savethis
+        
+        if self.sequences == []:
+            return
+            
+        if not loading_prev:
+            if self.save_this:
+                print(f"Saving encoded corpus for later use...")
+                #with open(f'models/{MODEL_NAME}/{MODEL_NAME}_{moddable_suffix}_data.pkl', 'wb') as file:
+                #    pickle.dump(chunk_token_ids, file)
+                #np.save(f'models/{MODEL_NAME}/{MODEL_NAME}_{moddable_suffix}_data.npy', np.array(chunk_token_ids, dtype=np.uint16))
+                _flat    = np.array([token for document in self.sequences for token in document], dtype=np.uint16)
+                _lengths = np.array([len(document) for document in self.sequences],  dtype=np.uint32)
+                t_suf = moddable_suffix.split('<')[-1]
+                t_suf = t_suf.split('>')[0]
+                
+                np.save(f'models/{MODEL_NAME}/{MODEL_NAME}_{t_suf}_flat.npy', _flat)
+                np.save(f'models/{MODEL_NAME}/{MODEL_NAME}_{t_suf}_lengths.npy', _lengths)
+                del _flat, _lengths
+        
+        if loading_prev:
+            print("Loading an encoded corpus...")
+            #with open(f'models/{prior_name}/{prior_name}_{moddable_suffix}_data.pkl', 'rb') as file:
+            #   chunk_token_ids = pickle.load(file)
+            #chunk_token_ids = np.load(f'models/{prior_name}/{prior_name}_{moddable_suffix}_data.npy').tolist()
+            t_suf = moddable_suffix.split('<')[-1]
+            t_suf = t_suf.split('>')[0]
+            
+            _flat    = np.load(f'models/{prior_name}/{prior_name}_{t_suf}_flat.npy')
+            _lengths = np.load(f'models/{prior_name}/{prior_name}_{t_suf}_lengths.npy')
+            # np.split on cumulative offsets reconstructs the ragged list in one call
+            self.sequences = np.split(_flat, np.cumsum(_lengths[:-1]))
+            del _flat, _lengths
+                    
+        print('Converting sequences from python-list to numpy')
+        self.sequences = np.array(self.sequences, dtype=np.uint16)
+        
+        
+        print(f"Created {len(self.sequences):,} training sequences")
+        print(f"We will be training on {len(self.sequences) * self.seq_len} tokens.")
+    
+    def __len__(self):
+        return len(self.sequences)
+    
+    def __getitem__(self, idx):
+        #chunk = self.sequences[idx]
+        chunk = self.sequences[idx].astype(np.int64)
+        x = torch.from_numpy(chunk[:-1])
+        y = torch.from_numpy(chunk[1:])
+        
+        #x = torch.tensor(chunk[:-1], dtype=torch.long)
+        #y = torch.tensor(chunk[1:], dtype=torch.long)
+        mask = (x != self.pad_id).long()
+        
+        return x, y, mask
+    
+    def split_array_randomly(self, split_percentage, seed=None):
+        """Split dataset into train/val."""
+        if seed is not None:
+            random.seed(seed)
+        
+        split_percentage = max(0, min(1, split_percentage))
+        sequences_copy = self.sequences.copy()
+        random.shuffle(sequences_copy)
+        
+        num_first_split = int(len(sequences_copy) * split_percentage)
+        first_split = sequences_copy[:num_first_split]
+        second_split = sequences_copy[num_first_split:]
+        
+        return first_split, second_split
+
+
+### Created by Deepseek, to use in place of 228 DataLoaders
+class CombinedValidationDataset(Dataset):
+    """Combined dataset that includes category information."""
+    
+    def __init__(self, validation_cat, tokenizer):
+        """
+        validation_cat: dict mapping category_id -> list of token sequences
+        """
+        self.tokenizer = tokenizer
+        
+        # Flatten all data with category labels
+        self.data = []
+        self.category_ids = []
+        
+        for category_id, sequences in validation_cat.items():
+            for seq in sequences:
+                self.data.append(seq)
+                self.category_ids.append(category_id)
+        
+        print(f"Testing on {len(self.data)} sequences across {len(validation_cat)} categories")
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        # Return the sequence and its category
+        seq = torch.tensor(self.data[idx], dtype=torch.long)
+        x = seq[:-1]
+        y = seq[1:]
+        mask = (x != self.tokenizer.token_to_id(PADDING_TOKEN)).long()
+        return x, y, mask, self.category_ids[idx]
+
+class OptimizedTrainer:
+    
+    def __init__(self, model: LanguageModel, tokenizer: Tokenizer, config: ModelConfig,
+                 learning_rate: float = 3e-4, cycle_length: int = 1000, weight_decay: float = 0.1, device: str = 'cuda',
+                 gradient_checkpointing: bool = False, compile_model: bool = True):
+        self.model = model.to(device)
+        self.tokenizer = tokenizer
+        self.config = config
+        self.device = device
+        self.cycle_length = cycle_length
+        self.max_lr = learning_rate
+        self.weight_decay_var = weight_decay
+        
+        # Gradient checkpointing (optional - trades compute for memory)
+        if gradient_checkpointing:
+            self._enable_gradient_checkpointing()
+            
+            
+        # Compile model for faster execution (PyTorch 2.0+)
+        #if device != 'cpu' and compile_model and hasattr(torch, 'compile'):
+        #    print("Compiling model with torch.compile...")
+        #    self.model = torch.compile(self.model)
+        
+        # Enable memory efficient attention
+        if hasattr(F, 'scaled_dot_product_attention'):
+            torch.backends.cuda.enable_flash_sdp(True)
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+        
+        
+        # Use AdamW with fused implementation (faster)
+        self.optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=learning_rate,
+            weight_decay=weight_decay,
+            betas=(self.config.beta1, self.config.beta2),  # From optimized code
+            eps=1e-8,
+            fused=True if device == 'cuda' else False
+        )
+        
+        # Loss function
+        self.criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.token_to_id(PADDING_TOKEN), label_smoothing=self.config.label_smoothing)
+        
+        # Mixed precision training
+        self.scaler = torch.amp.GradScaler('cuda')
+        self.use_amp = device == 'cuda'
+    
+    def _enable_gradient_checkpointing(self):
+        """Enable gradient checkpointing for memory efficiency."""
+        def make_checkpointed_forward(block):
+            original_forward = block.forward
+            
+            def checkpointed_forward(x, mask=None, cos=None, sin=None):
+                return torch.utils.checkpoint.checkpoint(
+                    original_forward, x, mask, cos, sin, use_reentrant=False
+                )
+            
+            return checkpointed_forward
+        
+        for block in self.model.blocks:
+            block.forward = make_checkpointed_forward(block)
+    
+    def train(self, training_start_time, train_data, val_cat, epochs: int, batch_size: int,
+              eval_interval: int = 600, save_interval: int = 2000, 
+              gradient_accumulation_steps: int = 4, current_epoch: int = 0, clean_slate_save: bool = True, loading_prev:bool=False, prior_name:str = "unnamed_model"):
+        """Train with all optimizations enabled."""
+        
+        config_info = f"{MODEL_NAME} Configuration = " + "{" +f"""
+\t"Suffix" = {self.config.additional_pref_suf}
+\t"Layers" = {self.config.n_layers},
+\t"Model Dim" = {self.config.d_model},
+\t"FeedForward Dim" = {self.config.d_ff},
+\t"Heads" = {self.config.n_heads},
+\t"Weight Dropout" = {self.config.dropout},
+\t"Vocab Size" = {self.config.vocab_size},
+\t"Max Seq Len" = {self.config.max_seq_len},
+\t"RoPE_freq = {self.config.RoPE_freq},
+\t"Weight Decay = {self.weight_decay_var},
+\t"Beta1 = {self.config.beta1},
+\t"Beta2 = {self.config.beta2},
+\t"Label Smoothing = {self.config.label_smoothing},
+\t"Max LR" = {self.max_lr},
+\t"Batch Size" = {batch_size},
+\t"Gradient Accumulation Steps" = {gradient_accumulation_steps},
+\t"Eval Interval" = {eval_interval},
+\t"Save Interval" = {save_interval},
+\t"Max Epochs" = {epochs},
+\t"Training Start Time" = {training_start_time}
+""" + "}"
+        
+        
+        os.makedirs(os.path.dirname(f"models/{MODEL_NAME}/"), exist_ok=True)
+        with open(f'models/{MODEL_NAME}/{MODEL_NAME}{self.config.additional_pref_suf}_configuration.txt', 'w') as file:
+            file.write(config_info)
+        
+        if clean_slate_save:    
+            self.model.save_checkpoint(
+                f'{MODEL_NAME}', 
+                f'{self.config.additional_pref_suf}_CleanSlate', 
+                self.tokenizer
+            )
+            
+        # Create datasets
+        training_dataset = TextDataset(train_data, self.config.max_seq_len, self.tokenizer, clean_slate_save, loading_prev, prior_name, 'training')
+        # validation_datasets = {}
+        # val_seq = 0
+        # for category_id in val_cat:
+        #     validation_datasets[category_id] = TextDataset(val_cat.get(category_id), self.config.max_seq_len, self.tokenizer, clean_slate_save, loading_prev, prior_name, self.tokenizer.decode([category_id], skip_special_tokens=False))
+        #     val_seq += len(val_cat.get(category_id))
+        # 
+        print(f"Training on: {len(training_dataset.sequences):,} sequences")
+        validation_dataset = CombinedValidationDataset(val_cat, self.tokenizer)
+        # print(f"Validating on: {val_seq:,} sequences")
+        
+        
+        
+        # Create dataloaders with optimized settings
+        dataloader = DataLoader(
+            training_dataset, 
+            batch_size=batch_size, 
+            shuffle=True, 
+            num_workers=2,  # Parallel data loading
+            pin_memory=False,  # Faster data transfer to GPU
+            persistent_workers=True,
+            prefetch_factor=8,
+            worker_init_fn=worker_init_fn
+        )
+        validation_dataloader = DataLoader(
+            validation_dataset, 
+            batch_size=128, 
+            shuffle=True, 
+            num_workers=2,
+            pin_memory=False,  
+            persistent_workers=True,
+            prefetch_factor=4,
+            worker_init_fn=worker_init_fn
+        )
+        
+        
+        
+        #validation_dataloaders = {}
+        #for category_id in val_cat:
+        #    validation_dataloaders[category_id] = DataLoader(
+        #        validation_datasets.get(category_id), 
+        #        batch_size=64, 
+        #        shuffle=True, 
+        #        num_workers=1,
+        #        pin_memory=False,
+        #        persistent_workers=False,
+        #        drop_last=True,
+        #        prefetch_factor=1,
+        #        worker_init_fn=worker_init_fn
+        #    )
+        
+        # Cosine annealing with warmup (from optimized code)
+        warmup_steps = (len(dataloader) / gradient_accumulation_steps) // 5
+        total_steps = (len(dataloader) // gradient_accumulation_steps) * epochs
+        
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return step / warmup_steps
+            # Cosine decay
+            progress = (step - warmup_steps) / (total_steps - warmup_steps)
+            return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * progress))
+        
+        scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
+        # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, total_steps)
+        # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, factor=0.7, patience=warmup_steps, cooldown=warmup_steps)
+        
+        
+        # Training loop
+        self.model.train()
+        print(f"Initialization took {(time.time() - training_start_time):.2f}s")
+        
+        global_step = 0
+        losses = []
+        all_training_loss = []
+        
+        validation_losses = []
+        testing_losses = []
+        best_val_loss = float('inf')
+        best_test_loss = float('inf')
+        times_test_loss_has_worsened = 0
+        total_times_test_loss_has_worsened = 0
+        
+        last_save_time = time.time()
+        last_eval_time = last_save_time
+        mandated_end_to_training = False
+        t_colour_str = '\x1B[38;5;229m'
+        for epoch in range(epochs-current_epoch):
+            pbar = tqdm(dataloader, desc=f"Epoch {epoch+1+current_epoch}/{epochs}")
+            epoch_losses = []
+            accumulated_loss = 0.0
+            
+            for batch_idx, (data_input, data_output, mask) in enumerate(pbar):
+                data_input = data_input.to(self.device, non_blocking=True)
+                data_output = data_output.to(self.device, non_blocking=True)
+                mask = mask.to(self.device, non_blocking=True)
+                
+                
+                loss = 0.0
+                # Mixed precision forward pass
+                with torch.amp.autocast('cuda', enabled=self.use_amp):
+                    logits = self.model(data_input, mask)
+                    loss = self.criterion(logits.view(-1, logits.size(-1)), data_output.view(-1))
+                    
+                    # Add MoE load balancing loss if applicable
+                    if self.config.use_moe and self.config.num_experts > 0:
+                        lb_loss = 0.0
+                        for block in self.model.blocks:
+                            if hasattr(block.ffn, 'load_balancing_loss') and block.ffn.load_balancing_loss is not None:
+                                lb_loss += block.ffn.load_balancing_loss
+                        loss = loss + 0.01 * lb_loss
+                    
+                    # Scale loss for gradient accumulation
+                loss /= gradient_accumulation_steps
+                accumulated_loss += loss
+                
+                # Backward pass
+                if self.use_amp:
+                    self.scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+                
+                # Optimizer step with gradient accumulation
+                if (batch_idx + 1) % gradient_accumulation_steps == 0:
+                    if self.use_amp:
+                        # Unscale and clip gradients
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                        
+                        # Optimizer step
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                    else:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                        self.optimizer.step()
+                    
+                    self.optimizer.zero_grad(set_to_none=True)
+                    scheduler.step()
+                    #scheduler.step(metrics=accumulated_loss)
+                    
+                    # Logging
+                    epoch_losses.append(accumulated_loss.item())
+                    all_training_loss.append(accumulated_loss.item())
+                    
+                    pbar.set_postfix({
+                        'loss': f'{accumulated_loss:.4f}',
+                        'lr': f'{scheduler.get_last_lr()[0]:.2e}'
+                    })
+                    accumulated_loss = 0.0
+                    
+                    global_step += 1
+                    
+                    # Evaluation
+                    if global_step % eval_interval == 0 or time.time() - last_eval_time >= 3600:
+                        #val_loss = self._calculate_validation_loss(validation_dataloader)
+                        #test_loss = self._calculate_validation_loss(validation_dataloaders)
+                        test_loss = self._calculate_validation_loss(validation_dataloader)
+                        
+                        #validation_losses.append((global_step, val_loss))
+                        testing_losses.append((global_step, test_loss))
+                        validation_losses.append((global_step, test_loss))
+                        os.makedirs(os.path.dirname(f'tracking/{MODEL_NAME}/'), exist_ok=True)
+                        with open(f'tracking/{MODEL_NAME}/{MODEL_NAME}{self.config.additional_pref_suf}_step_{global_step}_avg_tr_loss.pkl', 'wb') as file:
+                            pickle.dump(losses, file)
+                        with open(f'tracking/{MODEL_NAME}/{MODEL_NAME}{self.config.additional_pref_suf}_step_{global_step}_tr_loss.pkl', 'wb') as file:
+                            pickle.dump(all_training_loss, file)
+                        with open(f'tracking/{MODEL_NAME}/{MODEL_NAME}{self.config.additional_pref_suf}_step_{global_step}_val_loss.pkl', 'wb') as file:
+                            pickle.dump(validation_losses, file)
+                        with open(f'tracking/{MODEL_NAME}/{MODEL_NAME}{self.config.additional_pref_suf}_step_{global_step}_test_loss.pkl', 'wb') as file:
+                            pickle.dump(testing_losses, file)
+                        
+                        # Save best model
+                        t_colour_str = '\x1B[38;5;229m'
+                        
+                        if (test_loss < best_test_loss):
+                            divi = min(10.0, best_test_loss) / max(test_loss, 0.001)
+                            
+                            if divi > 1.03:
+                                t_colour_str = '\x1B[38;5;46m'
+                            elif divi > 1.01:
+                                t_colour_str = '\x1B[38;5;40m'
+                            elif divi > 1.005:
+                                t_colour_str = '\x1B[38;5;2m'
+                            elif divi > 1.001:
+                                t_colour_str = '\x1B[38;5;10m'
+                            
+                            best_test_loss = test_loss
+                            times_test_loss_has_worsened = 0
+                            self.model.save_checkpoint(f'{MODEL_NAME}', f'{self.config.additional_pref_suf}_best_test', self.tokenizer)
+                        else:
+                            times_test_loss_has_worsened += 1
+                            total_times_test_loss_has_worsened += 1
+                            if (test_loss > best_test_loss * 1.03):
+                                t_colour_str = '\x1B[38;5;196m'
+                                print("\x1B[38;5;196m\t[WARNING]: TEST LOSS EXCEEDS BEST BY 3%!!!\x1B[38;5;252m")
+                                mandated_end_to_training = True
+                            elif times_test_loss_has_worsened >= 5:
+                                t_colour_str = '\x1B[38;5;196m'
+                                print("\x1B[38;5;196m\t[WARNING]: TEST LOSS WORSENED 5x IN A ROW!!!\x1B[38;5;252m")
+                                mandated_end_to_training = True
+                            elif total_times_test_loss_has_worsened >= 8 and times_test_loss_has_worsened >= 2:
+                                t_colour_str = '\x1B[38;5;196m'
+                                print("\x1B[38;5;196m\t[WARNING]: TEST LOSS HAS PLATEAUED!!!\x1B[38;5;252m")
+                                mandated_end_to_training = True
+                            else:
+                                if times_test_loss_has_worsened > 4:
+                                    t_colour_str = '\x1B[38;5;160m'
+                                elif times_test_loss_has_worsened > 3:
+                                    t_colour_str = '\x1B[38;5;161m'
+                                elif times_test_loss_has_worsened > 2:
+                                    t_colour_str = '\x1B[38;5;203m'
+                                elif times_test_loss_has_worsened > 1:
+                                    t_colour_str = '\x1B[38;5;167m'
+                                elif times_test_loss_has_worsened > 0:
+                                    t_colour_str = '\x1B[38;5;209m'
+                                
+                                
+                        # print(f"\nStep {global_step} - Val Loss: {val_loss:.4f}, Test Loss: {t_colour_str}{test_loss:.4f}\x1B[38;5;252m")
+                        print(f"\nv Step {global_step} - Test Loss: {t_colour_str}{test_loss:.4f}\x1B[38;5;252m")
+                        
+                        # Generate samples
+                        self._generate_sample()
+                        
+                        print(f"\n^ Step {global_step} - Test Loss: {t_colour_str}{test_loss:.4f}\x1B[38;5;252m")
+                        
+                        last_eval_time = time.time()
+                    
+                    # Periodic checkpoint
+                    if global_step % save_interval == 0 or time.time() - last_save_time >= 1800 or mandated_end_to_training:
+                    
+                        #val_loss = self._calculate_validation_loss(validation_dataloader)
+                        #test_loss = self._calculate_validation_loss(validation_dataloaders)
+                        #validation_losses.append((global_step, val_loss))
+                        #testing_losses.append((global_step, test_loss))
+                        #validation_losses.append((global_step, test_loss))
+                        
+                        os.makedirs(os.path.dirname(f'tracking/{MODEL_NAME}/'), exist_ok=True)
+                        with open(f'tracking/{MODEL_NAME}/{MODEL_NAME}{self.config.additional_pref_suf}_step_{global_step}_avg_tr_loss.pkl', 'wb') as file:
+                            pickle.dump(losses, file)
+                        with open(f'tracking/{MODEL_NAME}/{MODEL_NAME}{self.config.additional_pref_suf}_step_{global_step}_tr_loss.pkl', 'wb') as file:
+                            pickle.dump(all_training_loss, file)
+                        with open(f'tracking/{MODEL_NAME}/{MODEL_NAME}{self.config.additional_pref_suf}_step_{global_step}_val_loss.pkl', 'wb') as file:
+                            pickle.dump(validation_losses, file)
+                        with open(f'tracking/{MODEL_NAME}/{MODEL_NAME}{self.config.additional_pref_suf}_step_{global_step}_test_loss.pkl', 'wb') as file:
+                            pickle.dump(testing_losses, file)
+                        # print(f"\nStep {global_step} - Val Loss: {val_loss:.4f}, Test Loss: {test_loss:.4f}")
+                        # print(f"\n^ Step {global_step} - Test Loss: {t_colour_str}{test_loss:.4f}\x1B[38;5;252m")
+                        self.model.save_checkpoint(
+                            f'{MODEL_NAME}', 
+                            f'{self.config.additional_pref_suf}_step_{global_step}', 
+                            self.tokenizer
+                        )
+                        last_save_time = time.time()
+                if mandated_end_to_training:
+                    break
+            if mandated_end_to_training:
+                break
+            
+            # End of epoch
+            avg_loss = np.mean(epoch_losses)
+            losses.append(avg_loss)
+            
+            #val_loss = self._calculate_validation_loss(validation_dataloader)
+            #test_loss = self._calculate_validation_loss(validation_dataloaders)
+            test_loss = self._calculate_validation_loss(validation_dataloader)
+            
+            #validation_losses.append((global_step, val_loss))
+            testing_losses.append((global_step, test_loss))
+            validation_losses.append((global_step, test_loss))
+            
+            t_colour_str = '\x1B[38;5;229m'
+            #if (val_loss < best_val_loss):
+            #    best_val_loss = val_loss
+            if (test_loss < best_test_loss):
+                divi = min(10.0, best_test_loss) / max(test_loss, 0.001)
+                
+                if divi > 1.03:
+                    t_colour_str = '\x1B[38;5;46m'
+                elif divi > 1.01:
+                    t_colour_str = '\x1B[38;5;40m'
+                elif divi > 1.005:
+                    t_colour_str = '\x1B[38;5;2m'
+                elif divi > 1.001:
+                    t_colour_str = '\x1B[38;5;10m'
+                
+                best_test_loss = test_loss
+                times_test_loss_has_worsened = 0
+                self.model.save_checkpoint(f'{MODEL_NAME}', f'{self.config.additional_pref_suf}_best_test', self.tokenizer)
+            else:
+                times_test_loss_has_worsened += 1
+                total_times_test_loss_has_worsened += 1
+                if (test_loss > best_test_loss * 1.03):
+                    t_colour_str = '\x1B[38;5;83m'
+                    print("\x1B[38;5;196m\t[WARNING]: TEST LOSS EXCEEDS BEST BY 3%!!!\x1B[38;5;252m")
+                    mandated_end_to_training = True
+                elif times_test_loss_has_worsened >= 5:
+                    t_colour_str = '\x1B[38;5;196m'
+                    print("\x1B[38;5;196m\t[WARNING]: TEST LOSS WORSENED 5x IN A ROW!!!\x1B[38;5;252m")
+                    mandated_end_to_training = True
+                elif total_times_test_loss_has_worsened >= 8 and times_test_loss_has_worsened >= 2:
+                    t_colour_str = '\x1B[38;5;196m'
+                    print("\x1B[38;5;196m\t[WARNING]: TEST LOSS HAS PLATEAUED!!!\x1B[38;5;252m")
+                    mandated_end_to_training = True
+                else:
+                    if times_test_loss_has_worsened > 4:
+                        t_colour_str = '\x1B[38;5;160m'
+                    elif times_test_loss_has_worsened > 3:
+                        t_colour_str = '\x1B[38;5;161m'
+                    elif times_test_loss_has_worsened > 2:
+                        t_colour_str = '\x1B[38;5;203m'
+                    elif times_test_loss_has_worsened > 1:
+                        t_colour_str = '\x1B[38;5;167m'
+                    elif times_test_loss_has_worsened > 0:
+                        t_colour_str = '\x1B[38;5;209m'
+            
+            os.makedirs(os.path.dirname(f'tracking/{MODEL_NAME}/'), exist_ok=True)
+            with open(f'tracking/{MODEL_NAME}/{MODEL_NAME}{self.config.additional_pref_suf}_step_{global_step}_avg_tr_loss.pkl', 'wb') as file:
+                pickle.dump(losses, file)
+            with open(f'tracking/{MODEL_NAME}/{MODEL_NAME}{self.config.additional_pref_suf}_step_{global_step}_tr_loss.pkl', 'wb') as file:
+                pickle.dump(all_training_loss, file)
+            with open(f'tracking/{MODEL_NAME}/{MODEL_NAME}{self.config.additional_pref_suf}_step_{global_step}_val_loss.pkl', 'wb') as file:
+                pickle.dump(validation_losses, file)
+            with open(f'tracking/{MODEL_NAME}/{MODEL_NAME}{self.config.additional_pref_suf}_step_{global_step}_test_loss.pkl', 'wb') as file:
+                pickle.dump(testing_losses, file)
+            
+            # print(f'\nEpoch {epoch+1} - Train Loss: {avg_loss:.4f}, Val Loss: {val_loss:.4f}, Test Loss: {t_colour_str}{test_loss:.4f}')
+            print(f'\nEpoch {epoch+1} - Train Loss: {avg_loss:.4f}, Test Loss: {t_colour_str}{test_loss:.4f}\x1B[38;5;252m')
+            
+            if not mandated_end_to_training:
+                self._generate_sample()
+        
+            if mandated_end_to_training:
+                break
+        
+        if mandated_end_to_training:
+            print("\x1B[38;5;196m\t[WARNING]: ENDING TRAINING EARLY!!!\x1B[38;5;214m")
+            print(f"\x1B[38;5;49m\tFinished with Best Test Loss of: \x1B[38;5;46m{best_test_loss}\x1B[38;5;214m")
+        
+        return losses, validation_losses, testing_losses
+    
+    def _calculate_validation_loss_old(self, dataloaders):
+        """Calculate validation loss efficiently."""
+        self.model.eval()
+        total_loss = 0.0
+        num_batches = 0
+        
+        with torch.no_grad():
+            print('')
+            cat_run = 0
+            val_str = ""
+            eval_start = time.time()
+            for category_id in dataloaders:
+                validation_dataloader = dataloaders.get(category_id)
+                val_batches = 0
+                cat_loss = 0.0
+                for data_input, data_output, mask in validation_dataloader:
+                    data_input = data_input.to(self.device, non_blocking=True)
+                    data_output = data_output.to(self.device, non_blocking=True)
+                    mask = mask.to(self.device, non_blocking=True)
+                    
+                    with torch.amp.autocast('cuda', enabled=self.use_amp):
+                        logits = self.model(data_input, mask)
+                        loss = self.criterion(logits.view(-1, logits.size(-1)), data_output.view(-1))
+                    
+                    lo_it = loss.item()
+                    
+                    total_loss += lo_it
+                    cat_loss += lo_it
+                    num_batches += 1
+                    val_batches += 1
+                cat_run += 1
+                cat_loss = cat_loss / max(val_batches, 1)
+                total_loss += cat_loss
+                val_str += f'{self.tokenizer.decode([category_id], skip_special_tokens=False):20s} {cat_loss:.4} {"":4s}'
+                if cat_run % 4 == 0:
+                    print(val_str)
+                    val_str = ""
+            print(val_str)
+            print(f'Evaluation Time: {(time.time()-eval_start)/60:.2f} minutes')
+
+        
+        self.model.train()
+        return total_loss / max(len(dataloaders), 1)
+        #return total_loss / max(num_batches, 1)
+    
+    def _calculate_validation_loss(self, dataloader):
+        """Calculate validation loss efficiently using batched data."""
+        self.model.eval()
+        category_losses = {}
+        category_counts = {}
+        
+        with torch.no_grad():
+            print('')
+            eval_start = time.time()
+            val_str = ""
+            cat_run = 0
+            
+            for data_input, data_output, mask, category_ids in dataloader:
+                data_input = data_input.to(self.device, non_blocking=True)
+                data_output = data_output.to(self.device, non_blocking=True)
+                mask = mask.to(self.device, non_blocking=True)
+                
+                with torch.amp.autocast('cuda', enabled=self.use_amp):
+                    logits = self.model(data_input, mask)
+                    loss = self.criterion(logits.view(-1, logits.size(-1)), data_output.view(-1))
+                
+                # Calculate per-category losses
+                loss_per_sample = loss.view(-1) if loss.dim() > 0 else loss
+                category_ids = category_ids.cpu().numpy()
+                
+                # Accumulate losses per category
+                for idx, cat_id in enumerate(category_ids):
+                    if cat_id not in category_losses:
+                        category_losses[cat_id] = 0.0
+                        category_counts[cat_id] = 0
+                    
+                    # Average loss over the sequence (if multiple tokens in batch)
+                    seq_loss = loss_per_sample[idx].item() if loss_per_sample.dim() > 0 else loss_per_sample.item()
+                    category_losses[cat_id] += seq_loss
+                    category_counts[cat_id] += 1
+            
+            # Compute averages and print
+            sorted_cats = sorted(category_losses.keys())
+            for i, cat_id in enumerate(sorted_cats):
+                avg_loss = category_losses[cat_id] / category_counts[cat_id]
+                cat_name = self.tokenizer.decode([cat_id], skip_special_tokens=False)
+                val_str += f'{cat_name:20s} {avg_loss:.4f} {"":4s}'
+                
+                if (i + 1) % 4 == 0 or i == len(sorted_cats) - 1:
+                    print(val_str)
+                    val_str = ""
+            
+            # Calculate overall loss (average of category averages)
+            total_loss = sum(category_losses[cat_id] / category_counts[cat_id] 
+                            for cat_id in category_losses) / len(category_losses)
+            
+            print(f'Evaluation Time: {(time.time()-eval_start)/60:.2f} minutes')
+        
+        self.model.train()
+        return total_loss
+    
+    
+    @torch.no_grad()
+    def _generate_sample(self):
+        """Generate samples during training."""
+        self.model.eval()
+        
+        class_prompts = [
+            "<english>",
+            "<french>",
+            "<russian>",
+            "<spanish>",
+            "<chinese>",
+            "<muslim>",
+            "<jewish>",
+            "<modern-egyptian>"
+        ]
+        
+        name_prompts = [
+            "Richard Mcgee", # english
+            "Paislee Fletcher", # english
+            "Lucrèce Halphen", # french
+            "Tobie Reverdin", # french
+            "Goremykina Maya Danilovna", # russian
+            "Shchurova Larissa Grigorievna", # russian
+            "Shchurova Grigorievna", # russian (shortened)
+            "Lucia Sahagún", # spanish
+            "Dario Cantero", # spanish
+            "Lai Yin", # chinese
+            "Zhao Cui", # chinese
+            "Rasheeda al-Akram", # muslim
+            "Zeena el-Obeid", # muslim
+            "Hadar Deronda", # jewish
+            "Galia Bakstansky", # jewish
+            "Anwar Malouf", # modern-egyptian
+            "Kafele Ghanem" # modern-egyptian
+        ]
+        
+        
+        for prompt in class_prompts:
+            encoded = self.tokenizer.encode(BEGIN_OF_STREAM_TOKEN + prompt + RESPONSE_TOKEN)
+            if not encoded:
+                continue
+            
+            input_ids = torch.tensor([encoded.ids], dtype=torch.long).to(self.device)
+            
+            try:
+                output = self.model.generate(
+                    input_ids, 
+                    max_new_tokens=50, 
+                    temperature=0.8, 
+                    top_k=50
+                )
+                text = self.tokenizer.decode(output[0].tolist(), skip_special_tokens=False)
+                print(f'\nPrompt: "{prompt}"')
+                print(f'Generated: {text}')
+            except Exception as e:
+                print(f'Error generating for prompt "{prompt}": {e}')
+        print("")
+        for prompt in name_prompts:
+            encoded = self.tokenizer.encode(BEGIN_OF_STREAM_TOKEN + prompt + RESPONSE_TOKEN)
+            input_ids = torch.tensor([encoded.ids], dtype=torch.long).to(self.device)
+            
+            
+            # idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0, top_k: Optional[int] = None, top_p: Optional[float] = None
+            self.model.eval()
+            # Crop context if needed
+            idx_cond = input_ids if input_ids.size(1) <= self.config.max_seq_len else input_ids[:, -self.model.config.max_seq_len:]
+            
+            # Forward pass
+            logits = self.model(idx_cond)
+            logits = logits[:, -1, :]
+            probs = torch.softmax(logits, dim=-1)
+            top_probs, top_indices = torch.topk(probs, 5)
+            
+            top_probs = top_probs.squeeze(0) if top_probs.dim() > 1 else top_probs
+            top_indices = top_indices.squeeze(0) if top_indices.dim() > 1 else top_indices
+            
+            print(f"Top-5 next-token predictions for: {prompt!r}")
+            for token_id, p in zip(top_indices.cpu(), top_probs.cpu()):
+                # token_id and p are now scalar tensors (or integers)
+                token_str = self.tokenizer.decode([token_id.item()] if torch.is_tensor(token_id) else [token_id], skip_special_tokens=False)
+                prob_value = p.item() if torch.is_tensor(p) else p
+                print(f"{token_str:15s}  {prob_value*100:6.2f}%")     
+            print("")
+        
+        self.model.train()
+
+
+def count_parameters(model: nn.Module) -> int:
+    """Count trainable parameters."""
+    total = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f'Total trainable parameters: {total:,}')
+    return total
+
+
+
+
+def grab_file_names_recursive(directory_path):
+    file_name_arr_temp = get_file_names(directory_path)
+    file_name_arr = []
+    for file_name in file_name_arr_temp:
+        file_name_arr.append(f"{directory_path}/{file_name}")
+    
+    top_folders = get_folder_names(directory_path)
+    for folder_name in top_folders:
+        result = grab_file_names_recursive(f"{directory_path}/{folder_name}")
+        if len(file_name_arr) > 0:
+            file_name_arr.extend(result)
+        elif len(result) > 0:
+            file_name_arr = result
+    
+    return file_name_arr
+    
+def load_files_random(directory_path, max_files=600, seed=52):
+    file_name_arr = grab_file_names_recursive(directory_path)
+
+    random.seed(seed)
+    random.shuffle(file_name_arr)
+    chosen_files = []
+    data = []
+    num_files_chosen = 0
+    for file_name in file_name_arr:
+        if num_files_chosen >= max_files:
+            break
+        if file_name.endswith('.txt'):    
+            try:
+                with open(file_name, 'r', encoding='utf-8') as file:
+                    content = file.read()
+                    data.append(f'{BEGIN_OF_STREAM_TOKEN}\n{content}\n{END_OF_STREAM_TOKEN}{SEP_TOKEN}')            
+                    chosen_files.append(file_name)
+                    num_files_chosen += 1
+            except Exception as e:
+                print(f"Error reading {file_name}: {e}")
+                continue    
+    print(chosen_files)
+    return data
+
+def load_txt_files_with_pathlib(directory_path, max_files=600, seed=52):
+    """Load text files from directory."""
+    function_training_data = []
+    directory = Path(directory_path)
+    
+    number_of_files_searched = 0
+    for file_path in directory.rglob("*.txt"):
+        if number_of_files_searched >= max_files:
+            break
+        try:
+            content = file_path.read_text(encoding='utf-8')
+            function_training_data.append(f'{BEGIN_OF_STREAM_TOKEN}\n{content}\n{END_OF_STREAM_TOKEN}{SEP_TOKEN}')
+            print(f"Loaded: {file_path}")
+            number_of_files_searched += 1
+        except Exception as e:
+            print(f"Error reading {file_path}: {e}")
+            continue
+    
+    return function_training_data
+
+
+def train_tokenizer(vocab_size, special_tokens_param, unk_tok, added_toks, training_data, train=True):
+        """Train BPE tokenizer."""
+        spec_tok = special_tokens_param + added_toks
+        bpe_trainer = trainers.BpeTrainer(vocab_size=vocab_size, special_tokens=spec_tok)
+        tokenizer = Tokenizer(models.BPE(unk_token=unk_tok))
+        #tokenizer.add_tokens(added_toks)
+        tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel()
+        tokenizer.decoder = decoders.ByteLevel()
+        
+        if train:
+            tokenizer.train_from_iterator(training_data, trainer=bpe_trainer)
+        
+        return tokenizer
+
+def prompt_select(message: str, choices: list[Any]) -> Any:
+    return questionary.select(
+            message,
+            choices=choices,
+            style=Style([("highlighted", "reverse")]),
+        ).ask()
+
+def get_file_names(directory_path, sort=True, exclude_hidden=False):
+    """
+    Get file names from a directory with options.
+    
+    Args:
+        directory_path (str): Path to the directory
+        sort (bool): Whether to sort file names alphabetically
+        exclude_hidden (bool): Whether to exclude hidden files (starting with .)
+    
+    Returns:
+        list: List of file names
+    """
+    try:
+        # Convert to Path object for better handling
+        path = Path(directory_path)
+        
+        # Check if path exists
+        if not path.exists():
+            raise FileNotFoundError(f"Directory '{directory_path}' not found.")
+        
+        # Check if it's a directory
+        if not path.is_dir():
+            raise NotADirectoryError(f"'{directory_path}' is not a directory.")
+        
+        # Get all files
+        files = []
+        for item in path.iterdir():
+            if item.is_file():
+                file_name = item.name
+                # Skip hidden files if requested
+                if exclude_hidden and file_name.startswith('.'):
+                    continue
+                files.append(file_name)
+        
+        # Sort if requested
+        if sort:
+            files.sort()
+        
+        return files
+        
+    except Exception as e:
+        print(f"Error: {e}")
+        return []
+
+
+def get_folder_names(directory_path, sort=True, exclude_hidden=False):
+    """
+    Get folder names from a directory with options.
+    
+    Args:
+        directory_path (str): Path to the directory
+        sort (bool): Whether to sort folder names alphabetically
+        exclude_hidden (bool): Whether to exclude hidden folders (starting with .)
+    
+    Returns:
+        list: List of folder names
+    """
+    try:
+        # Convert to Path object for better handling
+        path = Path(directory_path)
+        
+        # Check if path exists
+        if not path.exists():
+            raise FileNotFoundError(f"Directory '{directory_path}' not found.")
+        
+        # Check if it's a directory
+        if not path.is_dir():
+            raise NotADirectoryError(f"'{directory_path}' is not a directory.")
+        
+        # Get all directories
+        folders = []
+        for item in path.iterdir():
+            if item.is_dir():
+                folder_name = item.name
+                # Skip hidden folders if requested
+                if exclude_hidden and folder_name.startswith('.'):
+                    continue
+                folders.append(folder_name)
+        
+        # Sort if requested
+        if sort:
+            folders.sort()
+        
+        return folders
+        
+    except Exception as e:
+        print(f"Error: {e}")
+        return []
+
+def set_seed(seed):
+    """Set seeds for reproducibility across different libraries."""
+    # PyTorch seeds
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # if using multi-GPU
+    
+    # NumPy seed
+    np.random.seed(seed)
+    
+    # Python random module seed
+    random.seed(seed)
+
+def worker_init_fn(worker_id):
+    """
+    Picklable function to set seeds for each worker.
+    Use a global seed or pass the seed as an argument when creating the DataLoader.
+    """
+    # Use a global seed or a seed passed through a global variable
+    set_seed(457 + worker_id)
+
+
+def build_training_data(tokenizer_param, val_min, val_data_only=False):
+    validation_cat = {}
+    training_data = []
+    class_tokens = [RESPONSE_TOKEN]
+
+    bigg_len = 0
+    resp_tok = tokenizer_param.token_to_id(class_tokens[0])
+    bos_tok = tokenizer_param.token_to_id(BEGIN_OF_STREAM_TOKEN)
+    eos_tok = tokenizer_param.token_to_id(END_OF_STREAM_TOKEN)
+    pad_tok = tokenizer_param.token_to_id(PADDING_TOKEN)
+    
+    folder_names = get_folder_names('data')
+    for folder in tqdm(folder_names, desc='Processing folders...'):
+        files_in_folder = get_file_names(f'data/{folder}')
+        folder_marker = f'<{folder}-Misc>'
+        folder_cnt = 0
+        folder_cat_cnt = 0
+        for file in tqdm(files_in_folder, desc=f'Processing {folder}...'):
+            ac_identifier = file.split("-names.txt")[0]
+            with open(f'data/{folder}/{file}', 'r', encoding='utf-8') as r_file:
+                
+                f_data = r_file.read()
+                f_data_by_line = f_data.split("\n")
+                
+                num_unique_examples_for_cat = len(f_data_by_line)
+                if num_unique_examples_for_cat != 0 and num_unique_examples_for_cat < 2500:
+                    print(f'\n\x1B[38;5;196m[WARNING]\x1B[38;5;254m: <{ac_identifier}> only has {num_unique_examples_for_cat} unique names!\n')
+                    class_tok = tokenizer_param.token_to_id(folder_marker)
+                    if folder_marker not in class_tokens:
+                        class_tokens.append(folder_marker)
+                        validation_cat[folder_marker] = []
+                    folder_cnt += num_unique_examples_for_cat
+                    folder_cat_cnt += 1
+                else:
+                    class_tokens.append(f'<{ac_identifier}>')
+                    class_tok = tokenizer_param.token_to_id(class_tokens[-1])
+                    
+                file_arr_stockpile = []                
+                val_cat_stockpile = []
+                
+                ent_val = 0
+                max_for_val = max(val_min, min(len(f_data_by_line) * 0.05, 4096))
+                single_names = []
+                
+                f_entry = True
+                for entry in f_data_by_line:
+                    if f_entry:
+                        validation_cat[class_tok] = []
+                        f_entry = False
+                    chosen_entry = False
+                    if ent_val <= max_for_val:
+                        chosen_entry = True
+                    elif val_data_only:
+                        break
+                        
+                    # This is to get examples of First/Last Name by themselves, and First-Last Name, that way groups that have first/middle/last names aren't disqualified from being guessed just because only a first/last name are provided.
+                    name_collection = entry.split(" ")
+                    if "(" not in entry and len(name_collection) == 3:
+                        name_collection.append(f'{name_collection[0]} {name_collection[2]}')
+                    elif "(" not in entry and len(name_collection) == 4:
+                        name_collection.append(f'{name_collection[0]} {name_collection[3]}')
+                    name_collection.append(entry)
+                    for name in name_collection:
+                        # This is to prevent hundreds of entries of the same name for categories that had names generated via First Name / Last Name Pairs
+                        if name in single_names:
+                            continue
+                        else:
+                            single_names.append(name)
+                    
+                        token_ids_class_first = [bos_tok, class_tok, resp_tok]
+                        enc_name = tokenizer_param.encode(name).ids
+                        token_ids_class_first.extend(enc_name)
+                        token_ids_class_first.append(eos_tok)
+                        bigg_len = max(len(token_ids_class_first), bigg_len)
+                        token_ids_class_first.extend([pad_tok]*(sequence_len-len(token_ids_class_first)))
+                        
+                        
+                        
+                        token_ids_entry_first = [bos_tok]
+                        token_ids_entry_first.extend(enc_name)
+                        token_ids_entry_first.extend([resp_tok, class_tok, eos_tok])
+                        bigg_len = max(len(token_ids_entry_first), bigg_len)
+                        token_ids_entry_first.extend([pad_tok]*(sequence_len - len(token_ids_entry_first)))
+                        if f_entry or chosen_entry:
+                            val_cat_stockpile.append(token_ids_class_first)
+                            val_cat_stockpile.append(token_ids_entry_first)
+                            ent_val += 1
+                        elif not val_data_only:
+                            training_data.append(token_ids_class_first)
+                            training_data.append(token_ids_entry_first)
+                            
+    
+                if num_unique_examples_for_cat != 0 and num_unique_examples_for_cat < 2500:
+                    validation_cat[class_tok].extend(val_cat_stockpile)
+                else:
+                    validation_cat[class_tok] = val_cat_stockpile
+        if folder_cat_cnt > 0:
+            print(f'\n\x1B[38;5;196m[ANNOUNCEMENT]\x1B[38;5;254m: {folder_marker} has been instanced from {folder_cat_cnt} Categories for a total of {folder_cnt} names!\n')
+    
+    print(f"MAXIMUM SEQUENCE LENGTH: {bigg_len}")
+    return validation_cat, training_data, class_tokens
+    
+
+lorem_ipsum_placeholder = """
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit. Duis felis ex, sollicitudin id lacinia id, volutpat suscipit magna. Ut sit amet nibh diam. Morbi hendrerit mi vel erat gravida convallis. Nullam accumsan lacinia placerat. Sed ut turpis felis. Nulla non accumsan lacus. Proin elit mi, hendrerit nec molestie nec, bibendum non ipsum. Etiam ullamcorper mollis ornare. Fusce eleifend dictum dictum. Nulla imperdiet massa leo, at accumsan mi cursus vitae. Nulla laoreet erat at lectus tristique, in blandit nunc semper. Duis libero est, vulputate vel eleifend at, pellentesque blandit lectus.
+
+Proin at sollicitudin justo. Cras varius venenatis dolor sed imperdiet. Nulla ornare commodo posuere. Morbi finibus orci dolor, quis varius massa feugiat et. Nullam iaculis posuere ornare. Sed ultricies, sem sit amet semper placerat, arcu justo rutrum lorem, in vulputate orci quam mollis quam. Sed ornare nisi lobortis purus suscipit, non interdum justo imperdiet. Morbi vitae semper urna. Suspendisse eu viverra risus.
+
+Nulla ut urna facilisis justo maximus finibus in eu libero. Integer ut pharetra odio. In pulvinar mi at dictum luctus. Sed porttitor, mauris ac dignissim iaculis, arcu risus luctus enim, vel fermentum justo ligula at neque. Cras quis ornare orci. Sed varius risus lacus, accumsan commodo turpis lobortis id. Integer quis nibh non urna consequat egestas. Vivamus ut lobortis nisl. Nullam ut dui arcu. Vestibulum a faucibus leo, ac porta odio. Etiam ac metus eu lectus lobortis posuere. Aliquam pellentesque sem a augue malesuada imperdiet. Pellentesque convallis vulputate metus, at convallis ante ultricies nec. Fusce sit amet tellus dolor. Fusce vel augue sit amet dolor malesuada pretium.
+
+Phasellus lacinia mauris massa, vitae gravida mi malesuada id. Donec interdum risus arcu, et tincidunt elit bibendum at. Praesent lorem turpis, aliquet eu lorem id, vestibulum congue nibh. Quisque tincidunt diam dignissim velit malesuada, vitae ultricies justo blandit. Pellentesque pulvinar, enim lobortis semper lobortis, magna risus posuere sem, eu auctor metus nisl et augue. Pellentesque habitant morbi tristique senectus et netus et malesuada fames ac turpis egestas. Quisque mi purus, vulputate id sollicitudin ac, fringilla non purus. Orci varius natoque penatibus et magnis dis parturient montes, nascetur ridiculus mus. Nulla venenatis tincidunt diam, eu pharetra eros pretium sit amet.
+
+Suspendisse ac commodo nunc. Quisque ac ligula luctus, dignissim urna vitae, varius leo. Donec tristique semper lectus eu tincidunt. Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed ornare pulvinar dignissim. Praesent dignissim eu orci ultrices bibendum. Mauris metus est, sodales et posuere ut, dictum quis felis. Mauris consectetur quis risus ut pellentesque. Vivamus ac auctor orci. Vivamus pellentesque libero ut libero consectetur, sit amet rhoncus tellus lobortis. Aenean luctus libero sed sem gravida porta. Integer rhoncus purus risus, non mollis sapien molestie quis. Proin hendrerit ex ac tellus scelerisque, sed ornare tellus cursus. """
+
+
+
+
+
+if __name__ == "__main__":
+    
+    # Defaults
+    num_layers = 2
+    embed_dim = 16
+    ffn_dim = embed_dim * 4
+    num_heads = 1
+    weight_dropout = 0.25
+    training_rope_freq = 10000
+    
+    max_vocab_len = 8192
+    sequence_len = 32
+    # At 8192 Vocab on expanded data, biggest sequence length was 29; Set to 32 only to remain hardware aligned.
+    
+    
+    
+    personal_files = 80
+    data_files = 0
+    sm_data_include = True
+    LoC_data_include = False
+    
+    wei_decay = 0.001
+    num_batches = 128
+    # NOTE: EVen though plenty of memory for bigger batch sizes (as in could fit up to 1024 batch size), training is fastest at 128 batch size, training becomes 25% slower at 64 batche size, and 34% slower at 256 batch size
+    # Specifically on laptop with RTX 4060 GPU
+    
+    num_grad_step = 1
+    maximum_lr = 3e-4
+    num_epochs = 30
+    eval_iter = 10
+    save_iter = 200
+    
+    beta_alpha = 0.95
+    beta_beta = 0.995
+    label_smoothing_num = 0.0001
+    
+    valid_batch_mark = 128 # MUST MANUALLY SET
+    
+    operation_selection = prompt_select(
+        "Where do you wish to begin?",
+        choices=[
+            Choice(
+                title="From a 'CleanSlate'",
+                value="clean",
+            ),
+            Choice(
+                title="Continue In-Progress Training",
+                value="continue",
+            ),
+            Choice(
+                title="Begin New Training Run",
+                value="new_model",            
+            ),
+            Choice(
+                title="Inference",
+                value="inference",            
+            ),
+        ],
+    )
+    
+    if operation_selection == "clean":
+        PRIOR_MODEL_NAME = "unnamed_model"
+        
+        choices = []
+        folder_names = get_folder_names("models")
+        
+        if len(folder_names) < 1:
+            raise Exception("No prior models. Closing")
+        for index in range(len(folder_names)):
+            choices.append(Choice(title=folder_names[index], value=folder_names[index]))
+        PRIOR_MODEL_NAME = prompt_select("Which model-structure do you want to use?", choices)
+
+        
+        print("\x1B[38;5;123mTRAINING:\x1B[38;5;252m")
+        sequence_len = int(input("\x1B[38;5;252m\tSequence Length: \x1B[38;5;214m"))
+        training_rope_freq = int(input("\x1B[38;5;252m\tRoPE Freq: \x1B[38;5;214m"))
+        wei_decay = float(input("\x1B[38;5;252mWeight Decay: \x1B[38;5;214m"))
+        beta_alpha = float(input("\x1B[38;5;252mBeta1: \x1B[38;5;214m"))
+        beta_beta = float(input("\x1B[38;5;252mBeta2: \x1B[38;5;214m"))
+        label_smoothing_num = float(input("\x1B[38;5;252mLabel Smoothing: \x1B[38;5;214m"))
+        num_batches = int(input("\x1B[38;5;252mHow many sequences should be in each batch?: \x1B[38;5;214m"))
+        num_grad_step = int(input("\x1B[38;5;252mHow many gradient accumulation steps?: \x1B[38;5;214m"))
+        maximum_lr = float(input("\x1B[38;5;252mMaximum LR: \x1B[38;5;214m"))
+        num_epochs = int(input("\x1B[38;5;252mNum Epochs: \x1B[38;5;214m"))
+        eval_iter = int(input("\x1B[38;5;252mEvaluation Interval (Steps): \x1B[38;5;214m"))
+        save_iter = int(input("\x1B[38;5;252mSave Interval (Steps): \x1B[38;5;214m"))
+        MODEL_NAME = input("\x1B[38;5;252mModel Name: \x1B[38;5;214m")
+        print("\x1B[38;5;252m")
+
+        init_start_time = time.time()
+        config = ModelConfig(
+            vocab_size=max_vocab_len,
+            max_seq_len=sequence_len,
+            d_model=embed_dim,
+            n_layers=num_layers,
+            n_heads=num_heads, 
+            d_ff=ffn_dim,
+            dropout=weight_dropout,
+            use_moe=False,
+            num_experts=4,
+            moe_top_k=2,
+            use_flash_attn=True,
+            use_rmsnorm=True,
+            tie_embeddings=True,
+            use_swiglu=True,
+            RoPE_freq=training_rope_freq,
+            beta1=beta_alpha,
+            beta2=beta_beta,
+            label_smoothing=label_smoothing_num
+        )
+        
+        model = LanguageModel(config).to(device)
+        model, tokenizer = model.load_checkpoint(PRIOR_MODEL_NAME, '_CleanSlate')
+        model.eos_id = tokenizer.token_to_id(END_OF_STREAM_TOKEN)        
+        # THIS ASSUMES THAT NO ADDITIONAL CLASSIFIERS HAVE BEEN ADDED TO THE /DATA FOLDER
+        # IF ADDITIONAL CLASSES ARE ADDED, DO NOT USE _CleanSlate, AS THE TOKENIZER MUST BE RETRAINED
+        validation_dat, train_dat, class_tokens = build_training_data(tokenizer, valid_batch_mark, True)
+        
+        trainer = OptimizedTrainer(
+            model,
+            tokenizer,
+            config,
+            device=device,
+            learning_rate=maximum_lr,
+            cycle_length=1000,
+            weight_decay=wei_decay,
+            gradient_checkpointing=False,  # Set to True if running out of memory
+            compile_model=True  # Enable torch.compile for speed
+        )  
+        
+        losses, validation_losses, testing_data, = trainer.train(
+            init_start_time,
+            lorem_ipsum_placeholder,
+            validation_dat,
+            epochs=num_epochs,
+            batch_size=num_batches,
+            eval_interval=eval_iter,
+            save_interval=save_iter,
+            gradient_accumulation_steps=num_grad_step, # MAKE SURE BATCH_SIZE * GRADIENT STEPS IS 256 OR SMTH REASONABLE
+            clean_slate_save=False,
+            loading_prev=True,
+            prior_name=PRIOR_MODEL_NAME,
+        )
+        print("Saving final model...")
+        model.save_checkpoint(f'{MODEL_NAME}', '_final', tokenizer)
+        
+        print(f"\nTraining complete! Total time: {(time.time() - init_start_time)/60:.2f} minutes")
+            
+            
+    elif operation_selection == "continue":
+        choices = []
+        folder_names = get_folder_names("models")
+        
+        if len(folder_names) < 1:
+            raise Exception("No prior models. Closing")
+        for index in range(len(folder_names)):
+            choices.append(Choice(title=folder_names[index], value=folder_names[index]))
+        folder_name = prompt_select("Choose model folder", choices)
+        
+        file_names = get_file_names(f"models/{folder_name}")
+        
+        choices = []
+        for name in file_names:
+            if name.endswith('.pth'):
+                choices.append(Choice(title=name, value=name))
+        chosen_model = prompt_select("Choose model to continue from", choices)
+        chosen_model = chosen_model.split(".pth")[0]
+        
+        print("\x1B[38;5;123mTRAINING:\x1B[38;5;252m")
+        sequence_len = int(input("\x1B[38;5;252m\tSequence Length: \x1B[38;5;214m"))
+        training_rope_freq = int(input("\x1B[38;5;252m\tRoPE Frequency: \x1B[38;5;214m"))
+        wei_decay = float(input("\x1B[38;5;252mWeight Decay: \x1B[38;5;214m"))
+        beta_alpha = float(input("\x1B[38;5;252mBeta1: \x1B[38;5;214m"))
+        beta_beta = float(input("\x1B[38;5;252mBeta2: \x1B[38;5;214m"))
+        label_smoothing_num  = float(input("\x1B[38;5;252mLabel Smoothing: \x1B[38;5;214m"))
+        num_batches = int(input("\x1B[38;5;252mHow many sequences should be in each batch?: \x1B[38;5;214m"))
+        num_grad_step = int(input("\x1B[38;5;252mHow many gradient accumulation steps?: \x1B[38;5;214m"))
+        maximum_lr = float(input("\x1B[38;5;252mMaximum LR: \x1B[38;5;214m"))
+        num_epochs = int(input("\x1B[38;5;252mNum Epochs: \x1B[38;5;214m"))
+        eval_iter = int(input("\x1B[38;5;252mEvaluation Interval (Steps): \x1B[38;5;214m"))
+        save_iter = int(input("\x1B[38;5;252mSave Interval (Steps): \x1B[38;5;214m"))
+        print("\x1B[38;5;252m")
+        
+        additional_pref_suffix = ''
+        suffix = chosen_model.split(folder_name)[1]
+        change_model_name = prompt_select(
+            "Change Model Name?",
+            choices=[
+                Choice(
+                    title='No',
+                    value=False,
+                ),
+                Choice(
+                    title='Yes',
+                    value=True,
+                ),            
+            ]
+        )
+        
+        if change_model_name:
+            MODEL_NAME = input("\x1B[38;5;252mModel Name: \x1B[38;5;214m")
+            print("\x1B[38;5;252m")
+        else:
+            MODEL_NAME = folder_name   
+            
+            step_cnt = 0
+            if suffix.endswith('_final.pth'):
+                additional_pref_suffix = '_finalC'
+            elif suffix.endswith('_best.pth'):
+                additional_pref_suffix = '_bestC'
+            else:
+                temp_s = suffix.split('_step_')
+                if len(temp_s) > 1:
+                    temp_s = temp_s[1]
+                    step_cnt = temp_s.split('.pth')[0]
+                    additional_pref_suffix = f'_S{step_cnt}'
+                else:
+                    additional_pref_suffix = f''
+                
+            suffix = suffix.split('.pth')[0]
+    
+        print(f"NOTE: MAKE SURE THAT THERE IS A 'FOLDER-NAME_training_data.pkl' FILE IN models/{folder_name}/")
+        tr_present = prompt_select(
+            f"Is {folder_name}_training_data.pkl present??",
+            choices=[
+                Choice(
+                    title='Yes',
+                    value=True,
+                ),  
+                Choice(
+                    title='No',
+                    value=False,
+                ),          
+            ]
+        )
+        if not tr_present:
+            raise Exception("Can't continue training without training data")
+
+
+        init_start_time = time.time()
+        config = ModelConfig(
+            vocab_size=max_vocab_len,
+            max_seq_len=sequence_len,
+            d_model=embed_dim,
+            n_layers=num_layers,
+            n_heads=num_heads, 
+            d_ff=ffn_dim,
+            dropout=weight_dropout,
+            use_moe=False,
+            num_experts=4,
+            moe_top_k=2,
+            use_flash_attn=True,
+            use_rmsnorm=True,
+            tie_embeddings=True,
+            use_swiglu=True,
+            additional_pref_suf=additional_pref_suffix,
+            RoPE_freq=training_rope_freq,
+            beta1=beta_alpha,
+            beta2=beta_beta,
+            label_smoothing=label_smoothing_num
+        )
+        
+        model = LanguageModel(config).to(device)
+        
+        model, tokenizer = model.load_checkpoint(folder_name, suffix)
+        config.vocab_size = model.config.vocab_size
+        config.max_seq_len = model.config.max_seq_len
+        config.d_model = model.config.d_model
+        config.n_layers = model.config.n_layers
+        config.n_heads = model.config.n_heads
+        config.d_ff = model.config.d_ff
+        config.dropout = model.config.dropout
+        config.use_moe = model.config.use_moe
+        config.num_experts = model.config.num_experts
+        config.moe_top_k = model.config.moe_top_k
+        config.use_flash_attn = model.config.use_flash_attn
+        config.use_rmsnorm = model.config.use_rmsnorm
+        config.tie_embeddings = model.config.tie_embeddings
+        config.use_swiglu = model.config.use_swiglu
+        config.additional_pref_suf = model.config.additional_pref_suf
+        # config.RoPE_freq = model.config.RoPE_freq
+        # config.beta1 = model.config.beta1
+        # config.beta2 = model.config.beta2
+        # config.label_smoothing = model.config.label_smoothing
+        
+        model.eos_id = tokenizer.token_to_id(END_OF_STREAM_TOKEN)
+        
+        validation_cat, training_dat, class_tokens = build_training_data(tokenizer, valid_batch_mark, True)
+        
+        trainer = OptimizedTrainer(
+            model,
+            tokenizer,
+            config,
+            device=device,
+            learning_rate=maximum_lr,
+            cycle_length=1000,
+            weight_decay=wei_decay,
+            gradient_checkpointing=False,  # Set to True if running out of memory
+            compile_model=True  # Enable torch.compile for speed
+        )  
+        
+        losses, validation_losses, testing_losses = trainer.train(
+            init_start_time,
+            lorem_ipsum_placeholder,
+            validation_cat,
+            epochs=num_epochs,
+            batch_size=num_batches,
+            eval_interval=eval_iter,
+            save_interval=save_iter,
+            gradient_accumulation_steps=num_grad_step, # MAKE SURE BATCH_SIZE * GRADIENT STEPS IS 256 OR SMTH REASONABLE
+            clean_slate_save=False,
+            loading_prev=True,
+            prior_name=folder_name,
+        )
+        print("Saving final model...")
+        model.save_checkpoint(f'{MODEL_NAME}', f'{additional_pref_suffix}_final', tokenizer)
+        
+        print(f"\nTraining complete! Total time: {(time.time() - init_start_time)/60:.2f} minutes")
+        
+        
+    elif operation_selection == "new_model":
+        no_error = False
+        
+        
+        
+        no_error = prompt_select(
+            "Use defaults, or select hyperparameters?",
+            choices=[
+                Choice(
+                    title="Use Defaults",
+                    value=True,
+                ),
+                Choice(
+                    title="Pick-and-Choose Hyperparameters",
+                    value=False,
+                ),
+            ],
+        )
+        
+        while not no_error:
+            try:
+                print("\x1B[38;5;123mMODEL INITIALIZATION:\x1B[38;5;252m")
+                num_layers = int(input("\x1B[38;5;252m\tLayers: \x1B[38;5;214m"))
+                embed_dim = int(input("\x1B[38;5;252m\tEmbed Dim: \x1B[38;5;214m"))
+                ffn_dim = embed_dim * 4
+                num_heads = int(input("\x1B[38;5;252m\tHeads: \x1B[38;5;214m"))
+                weight_dropout = float(input("\x1B[38;5;252m\tDropout: \x1B[38;5;214m"))
+                
+                print("\x1B[38;5;123mDATA INITIALIZATION:\x1B[38;5;252m")
+                max_vocab_len = int(input("\x1B[38;5;252m\tVocab Size: \x1B[38;5;214m"))
+                sequence_len = int(input("\x1B[38;5;252m\tSequence Length: \x1B[38;5;214m"))
+                training_rope_freq = int(input("\x1B[38;5;252m\tRoPE Freq: \x1B[38;5;214m"))
+                    
+                print("\x1B[38;5;123mTRAINING:\x1B[38;5;252m")
+                wei_decay = float(input("\x1B[38;5;252mWeight Decay: \x1B[38;5;214m"))
+                beta_alpha = float(input("\x1B[38;5;252mBeta1: \x1B[38;5;214m"))
+                beta_beta = float(input("\x1B[38;5;252mBeta2: \x1B[38;5;214m"))
+                label_smoothing_num  = float(input("\x1B[38;5;252mLabel Smoothing: \x1B[38;5;214m"))
+                num_batches = int(input("\x1B[38;5;252mHow many sequences should be in each batch?: \x1B[38;5;214m"))
+                num_grad_step = int(input("\x1B[38;5;252mHow many gradient accumulation steps?: \x1B[38;5;214m"))
+                maximum_lr = float(input("\x1B[38;5;252mMaximum LR: \x1B[38;5;214m"))
+                num_epochs = int(input("\x1B[38;5;252mNum Epochs: \x1B[38;5;214m"))
+                eval_iter = int(input("\x1B[38;5;252mEvaluation Interval (Steps): \x1B[38;5;214m"))
+                save_iter = int(input("\x1B[38;5;252mSave Interval (Steps): \x1B[38;5;214m"))
+                MODEL_NAME = input("\x1B[38;5;252mModel Name: \x1B[38;5;214m")
+                
+                no_error = True
+            except KeyboardInterrupt:
+                print("\x1B[38;5;252mClosing...")
+                raise Exception('Closing')
+            except:
+                print("\x1B[38;5;252mERROR. You entered something incorrectly. Restarting.")
+    
+    
+        init_start_time = time.time()
+        print(f"\x1B[38;5;123mBEGINING TRAINING FOR: {MODEL_NAME}\x1B[38;5;252m")
+        
+        
+        # Load and prepare data
+        print("Loading training data...")
+        folder_names = get_folder_names('data')
+
+        class_tokens = [RESPONSE_TOKEN]
+
+        corpus_data = []
+        for folder in tqdm(folder_names, desc='Processing folders...'):
+            files_in_folder = get_file_names(f'data/{folder}')
+            folder_mark = f'<{folder}-Misc>'
+            # class_tokens.append(f'<{folder}>')
+            for file in tqdm(files_in_folder, desc=f'Processing {folder}...'):
+                with open(f'data/{folder}/{file}', 'r', encoding='utf-8') as r_file:
+                    
+                    
+                    f_data = r_file.read()
+                    f_data_by_line = f_data.split("\n")
+                    
+                    if len(f_data_by_line) != 0 and len(f_data_by_line) < REQUIRED_UNIQUE_NAMES:
+                        if folder_mark not in class_tokens:
+                            class_tokens.append(folder_mark)
+                    else:
+                        ac_identifier = file.split("-names.txt")[0]
+                        class_tokens.append(f'<{ac_identifier}>')
+                    corpus_data.append(f_data_by_line)
+
+       
+
+        
+        TOKENIZER = train_tokenizer(max_vocab_len, SPECIAL_TOKENS, UNKNOWN_TOKEN, class_tokens, corpus_data)
+        print(f'Vocab Size: {TOKENIZER.get_vocab_size()}')
+
+        
+        validation_cat, build_actual_training_data, class_tokens = build_training_data(TOKENIZER, valid_batch_mark, False)
+        
+        config = ModelConfig(
+            vocab_size=len(TOKENIZER.get_vocab()),
+            max_seq_len=sequence_len,
+            d_model=embed_dim,
+            n_layers=num_layers,
+            n_heads=num_heads,
+            d_ff=ffn_dim,
+            dropout=weight_dropout,
+            use_moe=False,
+            num_experts=4,
+            moe_top_k=2,
+            use_flash_attn=True,
+            use_rmsnorm=True,
+            tie_embeddings=True,
+            use_swiglu=True,
+            RoPE_freq=training_rope_freq,
+            beta1=beta_alpha,
+            beta2=beta_beta,
+            label_smoothing=label_smoothing_num
+        )
+        
+        # Create model
+        print("Creating model...")
+        model = LanguageModel(config).to(device)
+        model.eos_id = TOKENIZER.token_to_id(END_OF_STREAM_TOKEN)
+        count_parameters(model)
+        
+        # Train
+        print("Starting training...")
+        trainer = OptimizedTrainer(
+            model,
+            TOKENIZER,
+            config,
+            device=device,
+            learning_rate=maximum_lr,
+            cycle_length=1000,
+            weight_decay=wei_decay,
+            gradient_checkpointing=False,  # Set to True if running out of memory
+            compile_model=True  # Enable torch.compile for speed
+        )   
+        
+        losses, validation_losses, testing_losses = trainer.train(
+            init_start_time,
+            build_actual_training_data,
+            validation_cat,
+            epochs=num_epochs,
+            batch_size=num_batches,
+            eval_interval=eval_iter,
+            save_interval=save_iter,
+            gradient_accumulation_steps=num_grad_step, # MAKE SURE BATCH_SIZE * GRADIENT STEPS IS 256 OR SMTH REASONABLE
+            clean_slate_save=True,
+            loading_prev=False,
+            prior_name="unnamed_model",
+        )
+        
+        # Save final model
+        print("Saving final model...")
+        model.save_checkpoint(f'{MODEL_NAME}', '_final', TOKENIZER)
+        
+        print(f"\nTraining complete! Total time: {(time.time() - init_start_time)/60:.2f} minutes")
+
+
+    elif operation_selection == 'inference':
+        choices = []
+        folder_names = get_folder_names("models")
+        
+        if len(folder_names) < 1:
+            raise Exception("No prior models. Closing")
+        for index in range(len(folder_names)):
+            choices.append(Choice(title=folder_names[index], value=folder_names[index]))
+        folder_name = prompt_select("Which model-structure do you want to use?", choices)
+        
+        choices = []
+        for file_name in get_file_names(f'models/{folder_name}'):
+            if file_name.endswith('.pth'):
+                choices.append(Choice(value=file_name, title=file_name))
+        model_name = prompt_select("Which model do you want to use?", choices)
+        rem_ext = model_name.split('.pth')[0]
+        model_suff = ""
+        if '_step_' in rem_ext:
+            t_split = rem_ext.split("_step_")
+            model_suff = f'_step_{t_split[1]}'
+            model_name = t_split[0]
+        elif 'CleanSlate' in rem_ext:
+            t_split = rem_ext.split("_CleanSlate")
+            model_suff = '_CleanSlate'
+            model_name = t_split[0]
+        elif '_best_test' in rem_ext:
+            t_split = rem_ext.split("_best_test")
+            model_suff = '_best_test'
+            model_name = t_split[0]
+        else:
+            print(model_name)
+            print(rem_ext)
+            raise Exception
+        
+
+        config = ModelConfig(
+            vocab_size=max_vocab_len,
+            max_seq_len=sequence_len,
+            d_model=embed_dim,
+            n_layers=num_layers,
+            n_heads=num_heads, 
+            d_ff=ffn_dim,
+            dropout=weight_dropout,
+            use_moe=False,
+            num_experts=4,
+            moe_top_k=2,
+            use_flash_attn=True,
+            use_rmsnorm=True,
+            tie_embeddings=True,
+            use_swiglu=True,
+            RoPE_freq=training_rope_freq,
+            beta1=beta_alpha,
+            beta2=beta_beta,
+            label_smoothing=label_smoothing_num
+        )
+        
+        model = LanguageModel(config).to(device)
+        model, tokenizer = model.load_checkpoint(model_name, model_suff)
+        model.to(device)
+        
+        wants_to_continue = True
+        dict_alpha = {
+            'A': ['Ae', 'Ab', 'Ac', 'Ad', 'Af', 'Ag', 'Ah', 'Ai', 'Aj', 'Ak', 'Al', 'Am', 'An', 'Aq', 'Au', 'Ar', 'As', 'At', 'Av', 'Ax', 'Ay', 'Az'],
+            'B': ['Ba', 'Bh', 'Be', 'Bi', 'By', 'Bu', 'Bo'],
+            'C': ['Cy', 'Ca', 'Ch', 'Cth', 'Co', 'Cu', 'Ce', 'Ci', 'Cr'],
+            'D': ['Dr', 'Da', 'De', 'Di', 'Do', 'Du', 'Dy'],
+            'E': ['Eb', 'Ec', 'Ed', 'Ef', 'Eg', 'Eh', 'Ei', 'Ej', 'Ek', 'El', 'Em', 'En', 'Eo', 'Ep', 'Eq', 'Eu', 'Er', 'Es', 'Et', 'Ev', 'Ew', 'Ex', 'Ey', 'Ez'],
+            'F': ['Fr', 'Fa', 'Fe', 'Fi', 'Fy', 'Fo', 'Fu'],
+            'G': ['Ga', 'Ge', 'Gi', 'Go', 'Gu', 'Gy'],
+            'H': ['Ha', 'He', 'Hy', 'Hi', 'Ho', 'Hu', 'Hr'],
+            'I': ['Ib', 'Ic', 'Id', 'Ie', 'If', 'Ig', 'Ij', 'Ik', 'Il', 'Im', 'In', 'Io', 'Ip', 'Iq', 'Ir', 'Is', 'It', 'Iu', 'Iv', 'Iw', 'Ix', 'Iy', 'Iz'],
+            'J': ['Jr', 'Ja', 'Je', 'Ji', 'Jo', 'Ju', 'Jy'],
+            'K': ['Kh', 'Kr', 'Ka', 'Ke', 'Ko', 'Ki', 'Ku', 'Ky'],
+            'L': ['La', 'Le', 'Li', 'Ly', 'Lo', 'Lu'],
+            'M': ['Ma', 'Me', 'Mo', 'Mu', 'My', 'Mi'],
+            'N': ['Na', 'Ne', 'Ni', 'Ny', 'No', 'Nu'],
+            'O': ['Ob', 'Oc', 'Od', 'Oe', 'Of', 'Og', 'Oh', 'Oj', 'Ok', 'Ol', 'Om', 'On', 'Op', 'Oq', 'Or', 'Os', 'Ot', 'Ou', 'Ov', 'Ow', 'Ox', 'Oy', 'Oz'],
+            'P': ['Ph', 'Pa', 'Pe', 'Po', 'Pi', 'Pu', 'Py'],
+            'Q': ['Qa', 'Qu'],
+            'R': ['Ra', 'Ro', 'Re', 'Ru', 'Ri', 'Ry'],
+            'S': ['Sa', 'Se', 'So', 'Su', 'Si', 'Sy'],
+            'T': ['Tr', 'Ta', 'Te', 'Ti', 'To', 'Tu', 'Ty', 'Th'],
+            'U': ['Uc', 'Ub', 'Ud', 'Uf', 'Ug', 'Uh', 'Ui', 'Uj', 'Uk', 'Ul', 'Um', 'Un', 'Uo', 'Up', 'Uq', 'Ur', 'Us', 'Ut', 'Uv', 'Uw', 'Ux', 'Uy', 'Uz'],
+            'V': ['Vr', 'Va', 'Ve', 'Vi', 'Vo', 'Vu', 'Vy'],
+            'W': ['Wa', 'We', 'Wi', 'Wo', 'Wu', 'Wy'],
+            'X': ['Xa', 'Xi', 'Xe', 'Xo', 'Xu', 'Xy'],
+            'Y': ['Ya', 'Ye', 'Yi', 'Yo', 'Yu'],
+            'Z': ['Za', 'Ze', 'Zi', 'Zo', 'Zu', 'Zy']
+        }
+        dict_key_arr = []
+        for key in dict_alpha:
+            dict_key_arr.append(key)
+        while wants_to_continue:
+            mode_of_op = prompt_select('Select Operation', choices=[
+                Choice(value='name', title='Predict Category'),
+                Choice(value='class', title='Predict Name'),
+                Choice(value='calc', title='Calculate Average for NameList'),
+                Choice(value='exit', title='Exit')
+            ])
+            try:
+                if mode_of_op == 'exit':
+                    wants_to_continue = False
+                elif mode_of_op == 'class':
+                    usr_prompt = input('Prompt (Predict Name): ')
+                    encoded = tokenizer.encode(BEGIN_OF_STREAM_TOKEN + usr_prompt + RESPONSE_TOKEN)
+                    if not encoded:
+                        continue
+                    
+                    input_ids = torch.tensor([encoded.ids], dtype=torch.long).to(device)
+                    
+                    try:
+                        
+                        for index in range(20):
+                            full_name = False
+                            prev_ids = encoded.ids
+                            
+                            n_tries = 0
+                            while not full_name:
+                                wait_order = False
+                                output = model.generate(
+                                    torch.tensor([prev_ids], dtype=torch.long).to(device), 
+                                    max_new_tokens=32, 
+                                    temperature=0.8, 
+                                    top_k=50
+                                )
+                                n_tries += 1
+                                output_ids = output[0].tolist()
+                                decoded_ids = tokenizer.decode(output_ids, skip_special_tokens=False)
+                                # print(f'We decoded {decoded_ids}')
+                                decoded_ids = decoded_ids.split(END_OF_STREAM_TOKEN)[0]
+                                # print(f'We segmented it into: {decoded_ids}')
+                                re_encoded_ids = tokenizer.encode(decoded_ids).ids
+                                n_split = decoded_ids.split(' ')
+                                
+                                if re_encoded_ids == prev_ids and len(n_split) < 3:
+                                    re_encoded_ids.extend(tokenizer.encode(' '+ random.choice(dict_alpha.get(random.choice(dict_key_arr)))).ids)
+                                
+                                prev_ids = re_encoded_ids
+                                #if n_tries == 2:
+                                #    wait_order = True
+                                #    prev_ids.extend(tokenizer.encode(' '+ random.choice(cap_alpha)).ids)
+                                temp_text = tokenizer.decode(prev_ids, skip_special_tokens=False)
+                                n_split = temp_text.split(' ')
+                                # print(n_split)
+                                name_to_print = []
+                                for entry in n_split:
+                                    if entry == '' or entry == ' ' or len(entry) < 3:
+                                        continue
+                                    name_to_print.append(entry)
+                                if not wait_order and len(name_to_print) >= 3:
+                                    text = " ".join(name_to_print) + END_OF_STREAM_TOKEN
+                                    print(f'\nPrompt: "{usr_prompt}"')
+                                    print(f'Generated: {text}')
+                                    full_name = True
+                                    break
+                    except Exception as e:
+                        print(f'Error generating for prompt "{usr_prompt}": {e}')
+                elif mode_of_op == 'name':
+                    usr_prompt = input('Prompt (Predict Cat): ')
+                    encoded = tokenizer.encode(BEGIN_OF_STREAM_TOKEN + usr_prompt + RESPONSE_TOKEN)
+                    print(encoded.ids)
+                    input_ids = torch.tensor([encoded.ids], dtype=torch.long).to(device)
+                    
+                    
+                    # idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0, top_k: Optional[int] = None, top_p: Optional[float] = None
+                    model.eval()
+                    # Crop context if needed
+                    idx_cond = input_ids if input_ids.size(1) <= model.config.max_seq_len else input_ids[:, -model.config.max_seq_len:]
+                    
+                    # Forward pass
+                    logits = model(idx_cond)
+                    logits = logits[:, -1, :]
+                    probs = torch.softmax(logits, dim=-1)
+                    top_probs, top_indices = torch.topk(probs, 5)
+                    
+                    top_probs = top_probs.squeeze(0) if top_probs.dim() > 1 else top_probs
+                    top_indices = top_indices.squeeze(0) if top_indices.dim() > 1 else top_indices
+                    
+                    print(f"Top-5 next-token predictions for: {usr_prompt!r}")
+                    for token_id, p in zip(top_indices.cpu(), top_probs.cpu()):
+                        # token_id and p are now scalar tensors (or integers)
+                        token_str = tokenizer.decode([token_id.item()] if torch.is_tensor(token_id) else [token_id], skip_special_tokens=False)
+                        
+                        
+                        prob_value = p.item() if torch.is_tensor(p) else p
+                        print(f"{token_str:15s}  {prob_value*100:6.2f}%")     
+                    print("")
+                elif mode_of_op == 'calc':
+                    orig_list = """"""
+                
+                    nm_list = []
+                    n_split = orig_list.split('\n')
+                    for entry in n_split:
+                        if len(entry) > 2:
+                            nm_list.append(entry)
+                    nm_dict = {}
+                    for name in tqdm(nm_list, desc='Processing Names...'):                            
+                        encoded = tokenizer.encode(BEGIN_OF_STREAM_TOKEN + name + RESPONSE_TOKEN)
+                        input_ids = torch.tensor([encoded.ids], dtype=torch.long).to(device)
+                        model.eval()
+                        idx_cond = input_ids if input_ids.size(1) <= model.config.max_seq_len else input_ids[:, -model.config.max_seq_len:]
+                        logits = model(idx_cond)
+                        logits = logits[:, -1, :]
+                        probs = torch.softmax(logits, dim=-1)
+                        top_probs, top_indices = torch.topk(probs, 100)
+                        for token_id, p in zip(top_indices.cpu(), top_probs.cpu()):
+                            # token_id and p are now scalar tensors (or integers)
+                            categories = token_id.tolist()
+                            prob_values = p.tolist()
+                            for index in range(len(categories)):
+                                if categories[index] not in nm_dict:
+                                    nm_dict[categories[index]] = 0.0
+                                nm_dict[categories[index]] += prob_values[index]
+                    sorted_prob_key = []
+                    sorted_prob_key = sorted(nm_dict.items(), key=lambda x: x[1], reverse=True)
+                    top_cat = []
+                    for cat_str, tot_prob in sorted_prob_key:
+                        print(f"{tokenizer.decode([cat_str], skip_special_tokens=False):15s}  {(tot_prob/len(nm_list))*100:6.2f}%")  
+                
+                    pass
+            except KeyboardInterrupt:
+                pass
+            except Exception as e:
+                print(f'There was an Error: {e}')
+                break
+                
